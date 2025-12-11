@@ -15,9 +15,14 @@ import sys
 import os
 
 # 添加 backtest 目錄到路徑
-sys.path.insert(0, str(Path(__file__).parent / "backtest"))
-from backtester_grid import Backtester
-from indicators import adx, ema
+backtest_path = Path(__file__).parent / "backtest"
+sys.path.insert(0, str(backtest_path))
+# 使用動態導入以避免 linter 警告
+import importlib.util
+spec = importlib.util.spec_from_file_location("backtester_grid", backtest_path / "backtester_grid.py")
+backtester_grid_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(backtester_grid_module)
+Backtester = backtester_grid_module.Backtester
 
 getcontext().prec = 28
 LOG = logging.getLogger("OptunaOptimizer")
@@ -190,13 +195,10 @@ class OptunaOptimizer:
             backtester = Backtester(cfg, init_usdt, init_twd)
             
             # 在訓練集上執行回測
-            trade_log = backtester.run(self.train_df)
-            
-            # 計算最終權益
-            from backtester_grid import USDT_BALANCE, TWD_BALANCE, TOTAL_EQUITY_TWD
-            final_price = Decimal(str(self.train_df['close'].iloc[-1]))
-            final_equity = TWD_BALANCE + USDT_BALANCE * final_price
-            initial_equity = init_twd + init_usdt * Decimal(str(self.train_df['close'].iloc[0]))
+            result = backtester.run(self.train_df)
+            trade_log = result['trade_log']
+            final_equity = result['final_equity']
+            initial_equity = result['initial_equity']
             
             # 計算指標
             metrics = self._calculate_metrics(initial_equity, final_equity, trade_log, self.train_df)
@@ -293,12 +295,10 @@ class OptunaOptimizer:
         init_twd = Decimal(str(self.base_config.get('init_twd', 300000.0)))
         
         backtester = Backtester(cfg, init_usdt, init_twd)
-        trade_log = backtester.run(self.test_df)
-        
-        from backtester_grid import USDT_BALANCE, TWD_BALANCE
-        final_price = Decimal(str(self.test_df['close'].iloc[-1]))
-        final_equity = TWD_BALANCE + USDT_BALANCE * final_price
-        initial_equity = init_twd + init_usdt * Decimal(str(self.test_df['close'].iloc[0]))
+        result = backtester.run(self.test_df)
+        trade_log = result['trade_log']
+        final_equity = result['final_equity']
+        initial_equity = result['initial_equity']
         
         metrics = self._calculate_metrics(initial_equity, final_equity, trade_log, self.test_df)
         return metrics

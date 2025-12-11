@@ -114,9 +114,9 @@ def plot_backtest_results(price_df: pd.DataFrame, trade_log: List[Dict], output_
 
 # --- 核心回測邏輯 ---
 class Backtester:
-    def __init__(self, cfg: dict, init_usdt: Decimal, init_twd: Decimal):
-        # (此函數無變更)
+    def __init__(self, cfg: dict, init_usdt: Decimal, init_twd: Decimal, verbose: bool = True):
         self.cfg = cfg
+        self.verbose = verbose
         self.fee = Decimal(cfg['taker_fee'])
         self.min_order_value_twd = Decimal(cfg['min_order_value_twd'])
         self.grid_layers: List[GridLayer] = self._setup_grid_layers(cfg)
@@ -135,8 +135,9 @@ class Backtester:
         self.dmi_period = int(cfg['dmi_period'])
         global USDT_BALANCE, TWD_BALANCE, TOTAL_EQUITY_TWD
         USDT_BALANCE = init_usdt; TWD_BALANCE = init_twd; TOTAL_EQUITY_TWD = TWD_BALANCE
-        LOG.info("Backtester V9 Initialized: Simplified Entry & Active Grid.")
-        if self.use_hybrid: LOG.info(f"Hybrid mode ENABLED. Trend ADX Filter: >{self.adx_strength_threshold}, Aggressive Grid: <{self.grid_aggression_threshold}")
+        if self.verbose:
+            LOG.info("Backtester V9 Initialized: Simplified Entry & Active Grid.")
+            if self.use_hybrid: LOG.info(f"Hybrid mode ENABLED. Trend ADX Filter: >{self.adx_strength_threshold}, Aggressive Grid: <{self.grid_aggression_threshold}")
 
     def _setup_grid_layers(self, cfg: dict) -> List[GridLayer]:
         # (此函數無變更)
@@ -221,10 +222,13 @@ class Backtester:
 
     # --- V9 重大修改 ---
     # 重構 run 函數以整合順勢網格與簡化進場邏輯
-    def run(self, ohlc_df: pd.DataFrame) -> List[Dict]:
+    def run(self, ohlc_df: pd.DataFrame) -> Dict:
         global TWD_BALANCE, USDT_BALANCE
-        trade_log = [] 
-        LOG.info("Calculating all required indicators for V9 Model...")
+        trade_log = []
+        equity_history = []  # Track equity over time for drawdown calculation
+        
+        if self.verbose:
+            LOG.info("Calculating all required indicators for V9 Model...")
         price_series = ohlc_df['close'].ffill()
         
         # --- [修改開始] 將指標存入 ohlc_df 以便繪圖 ---
@@ -248,6 +252,7 @@ class Backtester:
         for i, price_val in enumerate(price_series):
             price = Decimal(str(price_val))
             self._update_equity(price)
+            equity_history.append(float(TOTAL_EQUITY_TWD))  # Track equity for drawdown
             if self.cooldown_counter > 0: self.cooldown_counter -= 1
             
             current_adx = adx_series.iloc[i]
@@ -284,8 +289,9 @@ class Backtester:
 
                     if trend_side:
                         self.strategy_state = 'TREND_FOLLOWING'
-                        LOG.warning(f"--- Bar {i} | Price {price:.3f} | Trend Entry Signal ---")
-                        LOG.warning(f"    - EMA={'BULL' if is_ema_bull else 'BEAR'}, ADX={current_adx:.2f} (> {self.adx_strength_threshold})")
+                        if self.verbose:
+                            LOG.warning(f"--- Bar {i} | Price {price:.3f} | Trend Entry Signal ---")
+                            LOG.warning(f"    - EMA={'BULL' if is_ema_bull else 'BEAR'}, ADX={current_adx:.2f} (> {self.adx_strength_threshold})")
 
                         # 清空網格，準備趨勢單
                         ACTIVE_ORDERS.clear()
@@ -297,7 +303,8 @@ class Backtester:
                                 TWD_BALANCE -= qty_to_buy * price * (1 + self.fee); USDT_BALANCE += qty_to_buy
                                 self.trend_position = {'side': 'long', 'entry_price': price, 'qty': qty_to_buy, 'peak_price': price}
                                 trade_log.append({'index': i, 'price': price, 'type': 'trend_long_entry'})
-                                LOG.info(f"    -> ACTION: Entered LONG position: {qty_to_buy:.4f} USDT @ {price:.3f}")
+                                if self.verbose:
+                                    LOG.info(f"    -> ACTION: Entered LONG position: {qty_to_buy:.4f} USDT @ {price:.3f}")
                                 # 立即建立順勢網格
                                 self._rebuild_grid(price, 'up', current_adx, trend_override='long')
                         else:
@@ -306,7 +313,8 @@ class Backtester:
                                 USDT_BALANCE -= qty_to_sell; TWD_BALANCE += qty_to_sell * price * (1 - self.fee)
                                 self.trend_position = {'side': 'short', 'entry_price': price, 'qty': qty_to_sell, 'valley_price': price}
                                 trade_log.append({'index': i, 'price': price, 'type': 'trend_short_entry'})
-                                LOG.info(f"    -> ACTION: Entered SHORT position: {qty_to_sell:.4f} USDT @ {price:.3f}")
+                                if self.verbose:
+                                    LOG.info(f"    -> ACTION: Entered SHORT position: {qty_to_sell:.4f} USDT @ {price:.3f}")
                                 # 立即建立順勢網格
                                 self._rebuild_grid(price, 'down', current_adx, trend_override='short')
 
@@ -337,8 +345,9 @@ class Backtester:
                         exit_reason = f"Trailing Stop Hit. Price ({price:.3f}) >= Stop Price ({stop_loss_price:.3f}). Valley price was {valley_price:.3f}."
                 
                 if should_exit:
-                    LOG.warning(f"--- Bar {i} | Price {price:.3f} | Trend Exit Signal ---")
-                    LOG.warning(f"    - REASON: {exit_reason}")
+                    if self.verbose:
+                        LOG.warning(f"--- Bar {i} | Price {price:.3f} | Trend Exit Signal ---")
+                        LOG.warning(f"    - REASON: {exit_reason}")
                     pnl = Decimal('0.0')
                     if side == 'long':
                         USDT_BALANCE -= qty; TWD_BALANCE += qty * price * (1 - self.fee)
@@ -347,8 +356,9 @@ class Backtester:
                         TWD_BALANCE -= qty * price * (1 + self.fee); USDT_BALANCE += qty
                         pnl = (entry_price - price) * qty
                     
-                    LOG.info(f"    -> ACTION: Exited {side.upper()} position. PNL: {pnl:,.2f} TWD.")
-                    LOG.info(f"    -> Switching to GRID mode (Cooldown: {self.cooldown_bars} bars).")
+                    if self.verbose:
+                        LOG.info(f"    -> ACTION: Exited {side.upper()} position. PNL: {pnl:,.2f} TWD.")
+                        LOG.info(f"    -> Switching to GRID mode (Cooldown: {self.cooldown_bars} bars).")
                     
                     trade_log.append({'index': i, 'price': price, 'type': 'trend_exit'})
                     self.trend_position = {}
@@ -366,9 +376,46 @@ class Backtester:
         final_equity = TWD_BALANCE + USDT_BALANCE * final_price
         pnl = final_equity - initial_equity
         roi_pct = (pnl / initial_equity) * 100 if initial_equity > 0 else 0
-        LOG.info("--- Backtest Finished ---"); LOG.info(f"Initial Equity: {initial_equity:,.2f} TWD"); LOG.info(f"Final Equity:   {final_equity:,.2f} TWD")
-        LOG.info(f"Total PNL:      {pnl:,.2f} TWD"); LOG.info(f"Total ROI:      {roi_pct:.2f}%"); LOG.info(f"Final Balance:  {USDT_BALANCE:.2f} USDT, {TWD_BALANCE:,.2f} TWD")
-        return trade_log
+        
+        # Calculate max drawdown
+        if len(equity_history) > 0:
+            equity_series = pd.Series(equity_history)
+            running_max = equity_series.expanding().max()
+            drawdown = (equity_series - running_max) / running_max
+            max_drawdown_pct = float(abs(drawdown.min())) * 100 if len(drawdown) > 0 else 0.0
+        else:
+            max_drawdown_pct = 0.0
+        
+        # Count total trades
+        total_trades = len(trade_log)
+        
+        if self.verbose:
+            LOG.info("--- Backtest Finished ---")
+            LOG.info(f"Initial Equity: {initial_equity:,.2f} TWD")
+            LOG.info(f"Final Equity:   {final_equity:,.2f} TWD")
+            LOG.info(f"Total PNL:      {pnl:,.2f} TWD")
+            LOG.info(f"Total ROI:      {roi_pct:.2f}%")
+            LOG.info(f"Max Drawdown:   {max_drawdown_pct:.2f}%")
+            LOG.info(f"Total Trades:   {total_trades}")
+            LOG.info(f"Final Balance:  {USDT_BALANCE:.2f} USDT, {TWD_BALANCE:,.2f} TWD")
+        
+        # Return stats dictionary for optimization
+        stats = {
+            'total_pnl': float(pnl),
+            'roi_pct': float(roi_pct),
+            'max_drawdown_pct': max_drawdown_pct,
+            'total_trades': total_trades,
+            'final_equity': float(final_equity),
+            # Keep original fields for backward compatibility
+            'trade_log': trade_log,
+            'initial_equity': float(initial_equity),
+            'final_usdt_balance': float(USDT_BALANCE),
+            'final_twd_balance': float(TWD_BALANCE),
+            'final_price': float(final_price),
+            'pnl': float(pnl)
+        }
+        
+        return stats
 
 # --- main 函數 (無變更) ---
 def main():
@@ -407,8 +454,9 @@ def main():
         LOG.error(f"A critical error occurred while reading or processing the CSV file: {e}", exc_info=True)
         return
     
-    backtester = Backtester(cfg, Decimal(str(args.init_usdt)), Decimal(str(args.init_twd)))
-    trade_log = backtester.run(price_df)
+    backtester = Backtester(cfg, Decimal(str(args.init_usdt)), Decimal(str(args.init_twd)), verbose=True)
+    result = backtester.run(price_df)
+    trade_log = result['trade_log']
     
     if trade_log:
         try:

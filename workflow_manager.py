@@ -141,13 +141,10 @@ class WorkflowManager:
             init_twd = Decimal(str(self.config.get('init_twd', 300000.0)))
             
             backtester = Backtester(self.config, init_usdt, init_twd)
-            trade_log = backtester.run(validation_df)
-            
-            # 計算最終權益
-            from backtest.backtester_grid import USDT_BALANCE, TWD_BALANCE
-            final_price = Decimal(str(validation_df['close'].iloc[-1]))
-            final_equity = TWD_BALANCE + USDT_BALANCE * final_price
-            initial_equity = init_twd + init_usdt * Decimal(str(validation_df['close'].iloc[0]))
+            result = backtester.run(validation_df)
+            trade_log = result['trade_log']
+            final_equity = result['final_equity']
+            initial_equity = result['initial_equity']
             
             validation_roi = float((final_equity - initial_equity) / initial_equity) if initial_equity > 0 else 0.0
             
