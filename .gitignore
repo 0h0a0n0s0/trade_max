@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# 系統文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 數據庫文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 數據文件（大型 CSV 文件）
+*.csv
+
+# 日誌文件
+*.log
+logs/
+
+# 環境變數和敏感配置
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# 配置文件（如果包含敏感信息，取消註釋）
+# config_*.yaml
+
+# 回測結果圖片（如果需要保留，請移除這行）
+*.png
+*.jpg
+*.jpeg
+
+# 臨時文件
+*.tmp
+*.temp
+.cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+

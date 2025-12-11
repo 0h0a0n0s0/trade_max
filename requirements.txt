@@ -1,0 +1,6 @@
+sqlalchemy
+pyyaml
+pandas
+python-dotenv
+aiohttp
+aiosqlite  # 如果您使用 SQLite

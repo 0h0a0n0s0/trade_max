@@ -1,0 +1,114 @@
+# config_usdttwd.yaml
+# Configuration for the live grid trading strategy based on backtester_grid.py logic
+
+# --- Market and Asset Identifiers ---
+asset_pair: "usdttwd"         # 交易對符號 (例如 MAX交易所 API 使用的)
+usdt_unit: "USDT"             # 基礎資產 (通常是被計價或累積的資產)
+twd_unit: "TWD"               # 報價資產 (通常是定價貨幣)
+price_precision: "0.001"      # 訂單價格精度 (例如 USDTTWD 為小數點後3位)
+qty_precision: "0.001"        # 訂單數量精度 (例如 USDT 為小數點後3位)
+
+# --- Core Grid Strategy Parameters (同步 backtester_grid.py 邏輯) ---
+# Grid Structure
+small_gap: "0.015"            # 最小網格間距 (TWD)
+mid_mult: 3                   # small_gap 的倍數，用於得到 mid_gap (mid_gap = small_gap * mid_mult)
+big_mult: 7                   # small_gap 的倍數，用於得到 big_gap (big_gap = small_gap * big_mult)
+levels_each: 4                # 每個網格層級在中心價上下各有多少層掛單
+
+# Order Sizing (每個層級訂單佔總權益的百分比)
+size_pct_small: "0.015"        # 小間距網格層的訂單
+size_pct_mid: "0.025"          # 中間距網格層的訂單
+size_pct_big: "0.035"          # 大間距網格層的訂單
+
+# Grid Recenter
+recenter_interval_minutes: 540 # 網格重新置中的間隔時間 (分鐘)。(backtester 使用 8000 根1分鐘bar)
+
+# --- Trend Following / Directional Bias Parameters (同步 backtester_grid.py 邏輯) ---
+ema_span_fast_bars: 120    # 快速EMA週期 (分鐘) (1分鐘K線下為10小時)
+ema_span_slow_bars: 600   # 慢速EMA週期 (分鐘) (1分鐘K線下為50小時)
+bias_high: "0.60"             # 看漲時的目標USDT曝險比例 (USDT價值 / 總權益)
+bias_low: "0.25"              # 看跌時的目標USDT曝險比例
+bias_neutral_target: "0.40"   # EMA快線 == EMA慢線 (趨勢中性) 時的目標USDT曝險比例
+bias_rebalance_threshold_twd: "1660.0" # 當前曝險與目標曝險差異超過此TWD等值時，進行再平衡
+                                      # (backtester 使用: price * Decimal("30"))
+bias_rebalance_fraction: "0.25" # 再平衡時，交易目標差異的比例 (例如只補足差異的25%)
+
+# --- Fees and Funding (同步 backtester_grid.py 邏輯) ---
+taker_fee: "0.001"            # 假設的交易手續費 (例如 0.1%)。用於PnL估算和訂單成本計算。
+                              # 注意: MAX 交易所的 maker/taker 手續費可能不同。此處為通用預估。
+                              # 實際手續費應從交易所成交回報中獲取。
+funding_rate_hour: "0.0"  # 每小時資金費率。正值 = 多頭支付空頭。
+                              # 此為模擬/追蹤用；實際資金費發生在永續合約。現貨網格策略中，此參數主要影響 PnL 的理論計算或對沖成本估算。
+
+# --- Strategy Operational Parameters (線上交易腳本專用) ---
+strategy_loop_interval_sec: 10 # 主策略邏輯迴圈的運行頻率 (秒)。(例如檢查是否需要重置網格、調整偏好倉位等)
+price_data_deque_size: 3100   # 為EMA計算保留的最近價格點數量 (1分鐘收盤價)。
+                              # 應大於 ema_span_slow_minutes。
+min_order_value_twd: "300.0"  # 單筆掛單的最小TWD價值 (交易所限制或自訂限制)。
+                              # 例如：如果訂單計算出的數量過小，則跳過該訂單。
+
+# --- Risk Management (整合 risk_controller.py) ---
+# risk_controller.py 會自行讀取其所需參數 (例如 max_net_open_usdt)
+# 此處可備註 risk_controller.py 使用的設定檔路徑 (若非預設)
+# risk_controller_config_path: "config_usdttwd.yaml" # risk_controller.py 已有預設邏輯尋找此檔案
+min_twd_balance_threshold: "16600.0" # 原為 5000，改為總TWD的 25% 左右，保留購買力
+
+
+# --- Black Swan Protection (沿用 strategy_usdttwd_grid.py 中的骨架) ---
+use_black_swan_protection: true   # 強烈建議在實盤中永遠開啟
+black_swan_check_minutes: 5
+black_swan_threshold_pct: "0.03"  # 價格在 N 分鐘內變動超過此百分比，觸發保護
+black_swan_cooldown_minutes: 999999 # 黑天鵝事件觸發後的冷卻時間 (分鐘)。行為已修改為永久停止，需手動重啟策略。
+
+# --- API Credentials & Database URI ---
+# !!! 重要 !!!
+# API 金鑰和資料庫連線字串等敏感資訊，**不應**直接寫在此檔案中。
+# 建議使用環境變數，並在 Python 腳本中透過 os.getenv() 讀取。
+#
+# 例如，在您的 .env 檔案中設定:
+# MAX_API_KEY="YOUR_MAX_API_KEY"
+# MAX_API_SECRET="YOUR_MAX_API_SECRET"
+# DB_URI="postgresql+asyncpg://user:password@host:port/database" # 或 "sqlite+aiosqlite:///trading.db"
+# TG_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
+# TG_CHAT_ID="YOUR_TELEGRAM_CHAT_ID"
+#
+# Python 腳本中讀取方式:
+# API_KEY = os.getenv("MAX_API_KEY")
+# DB_URI = os.getenv("DB_URI")
+
+# --- Advanced Alerts (進階警報設定) ---
+stagnation_alert_hours: 12 # 當策略在設定的小時數內沒有任何成交時，發送警報
+# drawdown_alert_pct: "0.10" # 當總權益從歷史最高點回撤超過此百分比時，發送警報 (例如 0.10 代表 10%)
+
+# --- Logging Configuration ---
+# 可在此處定義日誌級別，或由環境變數 STRATEGY_LOG_LEVEL 控制 (如 strategy_usdttwd_grid.py 所示)
+log_level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# --- ADX/ATR Dynamic Grid Parameters (For Backtester) ---
+# 新增的參數，用於控制 ADX 濾網和 ATR 動態間距
+use_adx_filter: False          # 是否啟用 ADX 市場狀態濾網
+adx_period: 14                # ADX 指標的計算週期
+adx_threshold: 35             # ADX 閾值。高於此值視為趨勢行情，將暫停網格交易
+
+use_atr_spacing: False         # 是否啟用 ATR 動態網格間距
+atr_period: 14                # ATR 指標的計算週期
+atr_spacing_multiplier: "0.5" # 網格基礎間距 = ATR * 這個乘數。例如 0.5 代表網格間距為 ATR 的一半
+
+# --- Hybrid Strategy Parameters (V5 - Trend Following Module) ---
+use_hybrid_model: true          # 是否啟用混合策略模型
+trend_trade_equity_pct: "0.4" # 執行趨勢交易時，投入的資金佔總權益的百分比 (例如 0.4 代表 40%)
+trend_trailing_stop_pct: "0.08" # 移動停利的百分比 (例如 0.02 代表 2%)
+
+# 指標週期設定 (MACD & DMI)
+macd_fast_period: 12
+macd_slow_period: 26
+macd_signal_period: 9
+dmi_period: 14                  # DMI (+DI / -DI) 的計算週期
+
+# 風險控制
+trend_cooldown_bars: 540      # 防挨打一筆趨勢交易結束後，進入冷卻狀態的 K 棒數量 (例如 240 根 1 分鐘 K 線 = 4 小時)
+
+# --- [V6 新增] 三態模型控制參數 ---
+adx_strength_threshold: 15      # ADX趨勢強度濾網：ADX值必須高於此數值，才會觸發趨勢交易
+grid_aggression_threshold: 20   # 積極網格模式的ADX觸發上限：ADX值必須低於此數值，才會進入積極網格模式
+grid_aggression_multiplier: "1.5" # 積極網格模式的資金放大係數 (例如 1.5 代表資金比例放大 50%)
