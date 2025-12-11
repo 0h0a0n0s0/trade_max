@@ -4,3 +4,7 @@ pandas
 python-dotenv
 aiohttp
 aiosqlite  # 如果您使用 SQLite
+optuna
+matplotlib
+numpy
+schedule  # 用於工作流程管理器定時任務

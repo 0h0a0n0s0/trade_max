@@ -80,6 +80,9 @@ LAST_REPORT_HOUR: int = -1
 LAST_TRADE_TS: Optional[datetime] = None
 LAST_STRATEGIC_ACTION_TS: Optional[datetime] = None
 LAST_BALANCE_LOG_TS: Optional[datetime] = None
+STRATEGY_STATE: str = "GRID"  # "GRID" or "TREND_FOLLOWING"
+TREND_POSITION: Optional[Dict] = None  # {'side': 'long'/'short', 'entry_price': Decimal, 'qty': Decimal, 'peak_price'/'valley_price': Decimal}
+COOLDOWN_COUNTER: int = 0
 
 class GridLayer:
     def __init__(self, idx: int, gap_abs: Decimal, size_pct: Decimal, levels_each_side: int):
@@ -482,18 +485,38 @@ async def place_grid_order(side: str, price: Decimal, qty: Decimal, layer_idx: O
 
     log.info(f"Attempting place: {client_oid} - {side.upper()} {qty_q} {CFG['usdt_unit']} @ {price_q} {CFG['twd_unit']}")
     try:
-        # --- 【↓↓↓ 最終核心修正：使用正確的訂單類型，並移除無效參數 ↓↓↓】 ---
-        # 網格訂單和偏好訂單都應為 'limit' (限價單)
-        # MAX API v2 文件中沒有 'post_only' 參數，故移除
+        # --- 【↓↓↓ 手續費優化：使用post-only訂單（maker訂單） ↓↓↓】 ---
+        # 嘗試使用post-only訂單以獲得maker費率（通常更低）
+        use_post_only = CFG.get('use_post_only_orders', True)
+        
+        # 獲取當前買賣一價，確保訂單不會立即成交
+        try:
+            ticker = await max_api.get_v2_ticker(market=CFG["asset_pair"])
+            if ticker:
+                best_bid = Decimal(str(ticker.get("buy", "0")))
+                best_ask = Decimal(str(ticker.get("sell", "0")))
+                
+                # 調整價格以確保是maker訂單
+                if side == "buy" and best_bid > 0:
+                    # 買單：掛在買一價下方
+                    price_q = min(price_q, best_bid * Decimal("0.9999"))
+                elif side == "sell" and best_ask > 0:
+                    # 賣單：掛在賣一價上方
+                    price_q = max(price_q, best_ask * Decimal("1.0001"))
+        except Exception as e:
+            log.debug(f"Failed to get ticker for post-only adjustment: {e}")
+        
+        # 根據交易所API支援情況選擇訂單類型
+        # 注意：MAX API可能不支援post_only參數，使用limit訂單
         response = await max_api.place_v2_order(
             market=CFG["asset_pair"], 
             side=side, 
             price=price_q, 
             volume=qty_q,
             client_oid=client_oid, 
-            ord_type='limit' 
+            ord_type='limit'  # 使用limit訂單，通過價格調整確保是maker
         )
-        # --- 【↑↑↑ 修正結束 ↑↑↑】 ---
+        # --- 【↑↑↑ 手續費優化結束 ↑↑↑】 ---
 
         if response and response.get("id"):
             order_data = {
@@ -556,13 +579,28 @@ async def handle_order_fill(fill_data: Dict):
                 realized_pnl = layer.gap_abs * cummulative_qty
                 log.info(f"GRID PNL: Realized PNL of approx. {realized_pnl:.4f} TWD from trade {client_oid}")
                 await run_db_sync(_db_log_daily_pnl_sync, {"realized_pnl_twd": realized_pnl})
-            new_side = "sell" if side == "buy" else "buy"
-            avg_fill_price = db_update_payload['average_fill_price']
-            new_price = quantize_price(avg_fill_price + layer.gap_abs if new_side == 'sell' else avg_fill_price - layer.gap_abs)
-            price_for_calc = await get_current_market_price() or new_price
-            new_qty = quantize_qty((layer.size_pct * TOTAL_EQUITY_TWD) / price_for_calc)
-            if new_qty > 0: await place_grid_order(new_side, new_price, new_qty, layer_idx, tag="gr_repl")
-            else: log.warning(f"Calculated replacement qty for {client_oid} is zero, skipping.")
+            
+            # 如果在趨勢跟隨模式中，成交後不再掛反向單
+            if STRATEGY_STATE == 'TREND_FOLLOWING' and TREND_POSITION:
+                # 只掛順勢單
+                trend_side = TREND_POSITION['side']
+                if (side == 'buy' and trend_side == 'long') or (side == 'sell' and trend_side == 'short'):
+                    # 順勢成交，繼續掛同向單
+                    new_side = side
+                    avg_fill_price = db_update_payload['average_fill_price']
+                    new_price = quantize_price(avg_fill_price + layer.gap_abs if new_side == 'sell' else avg_fill_price - layer.gap_abs)
+                    price_for_calc = await get_current_market_price() or new_price
+                    new_qty = quantize_qty((layer.size_pct * TOTAL_EQUITY_TWD) / price_for_calc)
+                    if new_qty > 0: await place_grid_order(new_side, new_price, new_qty, layer_idx, tag="gr_repl")
+            else:
+                # 標準網格模式：掛反向單
+                new_side = "sell" if side == "buy" else "buy"
+                avg_fill_price = db_update_payload['average_fill_price']
+                new_price = quantize_price(avg_fill_price + layer.gap_abs if new_side == 'sell' else avg_fill_price - layer.gap_abs)
+                price_for_calc = await get_current_market_price() or new_price
+                new_qty = quantize_qty((layer.size_pct * TOTAL_EQUITY_TWD) / price_for_calc)
+                if new_qty > 0: await place_grid_order(new_side, new_price, new_qty, layer_idx, tag="gr_repl")
+                else: log.warning(f"Calculated replacement qty for {client_oid} is zero, skipping.")
 
 
 # --- 啟動與網格管理 ---
@@ -601,7 +639,7 @@ async def poll_order_updates():
             log.warning(f"Error polling order status for {oid}: {e}")
         await asyncio.sleep(0.2)
 
-async def rebuild_grid_at_center(center_price: Decimal, full_rebuild: bool = True):
+async def rebuild_grid_at_center(center_price: Decimal, full_rebuild: bool = True, trend_override: str = 'none'):
     global LAST_RECENTER_TS, TOTAL_EQUITY_TWD
     log.info(f"Attempting to rebuild grid around new center price: {center_price}")
 
@@ -615,6 +653,32 @@ async def rebuild_grid_at_center(center_price: Decimal, full_rebuild: bool = Tru
     if price_for_calc <= 0:
         log.error("Invalid price for quantity calculation. Aborting grid rebuild.")
         return
+    
+    # --- 【新增】ATR動態網格間距 ---
+    use_atr_spacing = CFG.get('use_atr_spacing', False)
+    atr_multiplier = Decimal(str(CFG.get('atr_spacing_multiplier', '0.5')))
+    atr_period = int(CFG.get('atr_period', 14))
+    
+    # 保存原始間距，用於動態調整
+    dynamic_gaps = {}
+    if use_atr_spacing:
+        current_atr = calculate_atr_from_history(atr_period)
+        if current_atr and current_atr > 0:
+            # 動態調整網格間距：base_gap = ATR * multiplier
+            base_gap = current_atr * atr_multiplier
+            # 確保base_gap不會太小或太大
+            min_gap = Decimal(CFG.get("small_gap", "0.035"))
+            max_gap = Decimal("0.15")  # 最大間距限制
+            base_gap = max(min_gap, min(base_gap, max_gap))
+            
+            # 計算動態間距（不修改原始GRID_LAYERS）
+            dynamic_gaps[0] = base_gap
+            dynamic_gaps[1] = base_gap * int(CFG["mid_mult"])
+            dynamic_gaps[2] = base_gap * int(CFG["big_mult"])
+            
+            log.info(f"ATR-based dynamic spacing: ATR={current_atr:.4f}, Base gap={base_gap:.4f}")
+        else:
+            log.warning("ATR calculation failed, using default spacing")
 
     # 找出最小的訂單百分比，用於計算最小的訂單數量
     try:
@@ -657,10 +721,26 @@ async def rebuild_grid_at_center(center_price: Decimal, full_rebuild: bool = Tru
     for layer in GRID_LAYERS:
         qty_usdt = quantize_qty(layer.size_pct * TOTAL_EQUITY_TWD / price_for_calc)
         if qty_usdt <= 0: continue
-        for i in range(1, layer.levels_each_side + 1):
-            buy_price = quantize_price(center_price - (layer.gap_abs * i))
-            sell_price = quantize_price(center_price + (layer.gap_abs * i))
+        
+        # 使用動態間距（如果啟用ATR）或原始間距
+        gap_to_use = dynamic_gaps.get(layer.idx, layer.gap_abs)
+        
+        # 根據趨勢跟隨模式調整掛單
+        buy_levels = layer.levels_each_side
+        sell_levels = layer.levels_each_side
+        
+        # 如果在趨勢跟隨模式中，只掛順勢單
+        if trend_override == 'long':
+            sell_levels = 0  # 做多時不掛賣單
+        elif trend_override == 'short':
+            buy_levels = 0   # 做空時不掛買單
+        
+        for i in range(1, buy_levels + 1):
+            buy_price = quantize_price(center_price - (gap_to_use * i))
             if buy_price > 0: tasks.append(place_grid_order("buy", buy_price, qty_usdt, layer.idx))
+        
+        for i in range(1, sell_levels + 1):
+            sell_price = quantize_price(center_price + (gap_to_use * i))
             if sell_price > 0: tasks.append(place_grid_order("sell", sell_price, qty_usdt, layer.idx))
 
     await asyncio.gather(*tasks)
@@ -682,6 +762,63 @@ def calculate_ema_from_history(span: int) -> Optional[Decimal]:
         return Decimal(str(ema_val))
     except Exception: return None
 
+def calculate_atr_from_history(period: int = 14) -> Optional[Decimal]:
+    """
+    計算ATR指標（簡化版，使用價格變化估算）
+    """
+    if len(PRICE_HISTORY) < period:
+        return None
+    
+    try:
+        prices = [p[1] for p in PRICE_HISTORY]
+        series = pd.Series(prices, dtype=float)
+        
+        # 計算真實波幅（簡化：使用價格變化）
+        high_low = series.rolling(window=period, min_periods=period).max() - \
+                   series.rolling(window=period, min_periods=period).min()
+        
+        # 計算ATR（平均真實波幅）
+        atr = high_low.rolling(window=period, min_periods=period).mean()
+        
+        if len(atr) > 0 and not pd.isna(atr.iloc[-1]):
+            return Decimal(str(atr.iloc[-1]))
+        return None
+    except Exception as e:
+        log.warning(f"Failed to calculate ATR: {e}")
+        return None
+
+def calculate_adx_from_history(period: int = 14) -> Optional[Decimal]:
+    """
+    計算ADX指標（簡化版，僅使用收盤價估算）
+    注意：完整ADX需要high/low/close，此處使用簡化版本
+    """
+    if len(PRICE_HISTORY) < period * 2:
+        return None
+    
+    try:
+        # 簡化版：使用價格變化率估算趨勢強度
+        prices = [p[1] for p in PRICE_HISTORY]
+        series = pd.Series(prices, dtype=float)
+        
+        # 計算價格變化
+        price_changes = series.diff().abs()
+        
+        # 計算平均變化
+        avg_change = price_changes.rolling(window=period, min_periods=period).mean()
+        
+        # 計算價格範圍
+        price_range = series.rolling(window=period, min_periods=period).max() - \
+                     series.rolling(window=period, min_periods=period).min()
+        
+        # 簡化ADX：基於變化率與價格範圍的比值
+        if len(avg_change) > 0 and price_range.iloc[-1] > 0:
+            adx_approx = (avg_change.iloc[-1] / price_range.iloc[-1]) * 100
+            return Decimal(str(min(max(adx_approx, 0), 100)))  # 限制在0-100範圍
+        return None
+    except Exception as e:
+        log.warning(f"Failed to calculate ADX: {e}")
+        return None
+
 def get_ema_target_bias() -> Decimal:
     """
     【新增】根據EMA快慢線交叉，計算並返回目標USDT曝險比例。
@@ -700,6 +837,169 @@ def get_ema_target_bias() -> Decimal:
         return Decimal(CFG["bias_low"])
     else: # 快慢線相等，趨勢中性
         return Decimal(CFG["bias_neutral_target"])
+
+async def manage_hybrid_strategy():
+    """
+    【新增】管理混合策略模式（網格 + 趨勢跟隨）
+    根據ADX和EMA判斷是否進入趨勢跟隨模式
+    """
+    global STRATEGY_STATE, TREND_POSITION, COOLDOWN_COUNTER
+    
+    use_hybrid = CFG.get('use_hybrid_model', False)
+    if not use_hybrid:
+        return
+    
+    # 檢查冷卻期
+    if COOLDOWN_COUNTER > 0:
+        COOLDOWN_COUNTER -= 1
+        return
+    
+    # 計算ADX
+    adx_period = int(CFG.get('dmi_period', 14))
+    current_adx = calculate_adx_from_history(adx_period)
+    if current_adx is None:
+        return
+    
+    adx_threshold = int(CFG.get('adx_strength_threshold', 25))
+    
+    # 計算EMA
+    ema_fast = calculate_ema_from_history(int(CFG["ema_span_fast_bars"]))
+    ema_slow = calculate_ema_from_history(int(CFG["ema_span_slow_bars"]))
+    if ema_fast is None or ema_slow is None:
+        return
+    
+    current_price = await get_current_market_price()
+    if not current_price or current_price <= 0:
+        return
+    
+    is_ema_bull = ema_fast > ema_slow
+    is_ema_bear = ema_fast < ema_slow
+    is_adx_strong = current_adx > adx_threshold
+    
+    # 狀態機邏輯
+    if STRATEGY_STATE == 'GRID':
+        # 檢查是否應該進入趨勢跟隨模式
+        is_strong_uptrend = is_ema_bull and is_adx_strong
+        is_strong_downtrend = is_ema_bear and is_adx_strong
+        
+        if is_strong_uptrend or is_strong_downtrend:
+            # 進入趨勢跟隨模式
+            STRATEGY_STATE = 'TREND_FOLLOWING'
+            trend_side = 'long' if is_strong_uptrend else 'short'
+            
+            # 清空現有網格
+            await cancel_all_market_orders(reason="entering_trend_following")
+            await asyncio.sleep(2)
+            
+            # 建立趨勢倉位
+            trend_equity_pct = Decimal(str(CFG.get('trend_trade_equity_pct', '0.4')))
+            trade_value_twd = TOTAL_EQUITY_TWD * trend_equity_pct
+            
+            if trend_side == 'long':
+                qty_to_buy = quantize_qty(trade_value_twd / current_price)
+                if AVAILABLE_TWD_BALANCE >= trade_value_twd:
+                    # 下市價買單（用限價單模擬）
+                    buy_price = current_price * Decimal("1.001")  # 稍微高於市價以確保成交
+                    client_oid = await place_grid_order("buy", buy_price, qty_to_buy, layer_idx=None, tag="trend_long")
+                    if client_oid:
+                        TREND_POSITION = {
+                            'side': 'long',
+                            'entry_price': current_price,
+                            'qty': qty_to_buy,
+                            'peak_price': current_price
+                        }
+                        log.info(f"Entered TREND_FOLLOWING mode (LONG): {qty_to_buy:.4f} USDT @ {current_price:.3f}")
+                        msg = (f"📈 **進入趨勢跟隨模式（做多）**\n\n"
+                               f"ADX: `{current_adx:.2f}` (強趨勢)\n"
+                               f"EMA: 快線 > 慢線\n"
+                               f"建立多頭倉位: `{qty_to_buy:.4f} USDT` @ `{current_price:.3f}`")
+                        await alerter.send_strategy_event(msg, alert_key='trend_entry')
+                        # 建立順勢網格（只掛買單）
+                        await rebuild_grid_at_center(current_price, full_rebuild=False, trend_override='long')
+            else:  # short
+                qty_to_sell = quantize_qty(trade_value_twd / current_price)
+                if AVAILABLE_USDT_BALANCE >= qty_to_sell:
+                    # 下市價賣單（用限價單模擬）
+                    sell_price = current_price * Decimal("0.999")  # 稍微低於市價以確保成交
+                    client_oid = await place_grid_order("sell", sell_price, qty_to_sell, layer_idx=None, tag="trend_short")
+                    if client_oid:
+                        TREND_POSITION = {
+                            'side': 'short',
+                            'entry_price': current_price,
+                            'qty': qty_to_sell,
+                            'valley_price': current_price
+                        }
+                        log.info(f"Entered TREND_FOLLOWING mode (SHORT): {qty_to_sell:.4f} USDT @ {current_price:.3f}")
+                        msg = (f"📉 **進入趨勢跟隨模式（做空）**\n\n"
+                               f"ADX: `{current_adx:.2f}` (強趨勢)\n"
+                               f"EMA: 快線 < 慢線\n"
+                               f"建立空頭倉位: `{qty_to_sell:.4f} USDT` @ `{current_price:.3f}`")
+                        await alerter.send_strategy_event(msg, alert_key='trend_entry')
+                        # 建立順勢網格（只掛賣單）
+                        await rebuild_grid_at_center(current_price, full_rebuild=False, trend_override='short')
+    
+    elif STRATEGY_STATE == 'TREND_FOLLOWING':
+        if not TREND_POSITION:
+            # 如果沒有趨勢倉位，返回網格模式
+            STRATEGY_STATE = 'GRID'
+            return
+        
+        # 檢查止損條件
+        trailing_stop_pct = Decimal(str(CFG.get('trend_trailing_stop_pct', '0.02')))
+        side = TREND_POSITION['side']
+        should_exit = False
+        exit_reason = ""
+        
+        if side == 'long':
+            peak_price = max(TREND_POSITION.get('peak_price', current_price), current_price)
+            TREND_POSITION['peak_price'] = peak_price
+            stop_loss_price = peak_price * (Decimal("1.0") - trailing_stop_pct)
+            if current_price <= stop_loss_price:
+                should_exit = True
+                exit_reason = f"Trailing Stop Hit. Price ({current_price:.3f}) <= Stop ({stop_loss_price:.3f})"
+        
+        elif side == 'short':
+            valley_price = min(TREND_POSITION.get('valley_price', current_price), current_price)
+            TREND_POSITION['valley_price'] = valley_price
+            stop_loss_price = valley_price * (Decimal("1.0") + trailing_stop_pct)
+            if current_price >= stop_loss_price:
+                should_exit = True
+                exit_reason = f"Trailing Stop Hit. Price ({current_price:.3f}) >= Stop ({stop_loss_price:.3f})"
+        
+        if should_exit:
+            # 平倉
+            qty = TREND_POSITION['qty']
+            entry_price = TREND_POSITION['entry_price']
+            
+            if side == 'long':
+                # 賣出USDT
+                sell_price = current_price * Decimal("0.999")
+                await place_grid_order("sell", sell_price, qty, layer_idx=None, tag="trend_exit")
+                pnl = (current_price - entry_price) * qty
+            else:  # short
+                # 買回USDT
+                buy_price = current_price * Decimal("1.001")
+                await place_grid_order("buy", buy_price, qty, layer_idx=None, tag="trend_exit")
+                pnl = (entry_price - current_price) * qty
+            
+            log.info(f"Exited TREND_FOLLOWING mode. PNL: {pnl:.2f} TWD. Reason: {exit_reason}")
+            msg = (f"🔄 **退出趨勢跟隨模式**\n\n"
+                   f"原因: {exit_reason}\n"
+                   f"已實現損益: `{pnl:+.2f} TWD`")
+            await alerter.send_strategy_event(msg, alert_key='trend_exit')
+            
+            # 清空趨勢倉位
+            TREND_POSITION = None
+            STRATEGY_STATE = 'GRID'
+            
+            # 進入冷卻期
+            cooldown_bars = int(CFG.get('trend_cooldown_bars', 240))
+            COOLDOWN_COUNTER = cooldown_bars
+            
+            # 重建標準網格
+            await cancel_all_market_orders(reason="exiting_trend_following")
+            await asyncio.sleep(2)
+            await rebuild_grid_at_center(current_price, full_rebuild=False, trend_override='none')
 
 async def manage_directional_bias():
     """
@@ -899,12 +1199,21 @@ async def strategy_main_loop():
             if (now_utc - LAST_BALANCE_UPDATE_TS).total_seconds() >= int(CFG.get("api_balance_poll_interval_sec", 300)):
                 await update_balances_from_api()
             
+            # 混合策略管理（如果啟用）
+            if CFG.get('use_hybrid_model', False):
+                await manage_hybrid_strategy()
+            
             if (now_utc - LAST_BIAS_REBALANCE_TS).total_seconds() >= int(CFG.get("bias_check_interval_sec", 60)):
                 await manage_directional_bias()
             
             if (now_utc - LAST_RECENTER_TS).total_seconds() >= int(CFG.get("recenter_interval_minutes", 480)) * 60:
                 price = await get_current_market_price()
-                if price: await rebuild_grid_at_center(price, full_rebuild=True)
+                if price:
+                    # 根據當前策略狀態決定trend_override
+                    trend_override = 'none'
+                    if STRATEGY_STATE == 'TREND_FOLLOWING' and TREND_POSITION:
+                        trend_override = TREND_POSITION['side']
+                    await rebuild_grid_at_center(price, full_rebuild=True, trend_override=trend_override)
 
             if (now_utc - LAST_DB_BALANCE_SNAPSHOT_TS).total_seconds() >= int(CFG.get("db_snapshot_interval_sec", 3600)):
                 await run_db_sync(_db_log_balance_snapshot_sync)

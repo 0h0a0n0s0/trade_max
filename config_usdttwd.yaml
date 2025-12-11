@@ -16,9 +16,10 @@ big_mult: 7                   # small_gap 的倍數，用於得到 big_gap (big_
 levels_each: 6                # 每個網格層級在中心價上下各有多少層掛單
 
 # Order Sizing (每個層級訂單佔總權益的百分比)
-size_pct_small: "0.015"        # 小間距網格層的訂單
-size_pct_mid: "0.025"          # 中間距網格層的訂單
-size_pct_big: "0.035"          # 大間距網格層的訂單
+# 【優化】提升資金利用率：從1.5-3.5%提升至2.5-5.5%
+size_pct_small: "0.025"        # 小間距網格層的訂單（原0.015）
+size_pct_mid: "0.040"          # 中間距網格層的訂單（原0.025）
+size_pct_big: "0.055"          # 大間距網格層的訂單（原0.035）
 
 # Grid Recenter
 recenter_interval_minutes: 480 # 網格重新置中的間隔時間 (分鐘)。(backtester 使用 8000 根1分鐘bar)
@@ -84,6 +85,21 @@ stagnation_alert_hours: 12 # 當策略在設定的小時數內沒有任何成交
 # 可在此處定義日誌級別，或由環境變數 STRATEGY_LOG_LEVEL 控制 (如 strategy_usdttwd_grid.py 所示)
 log_level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
 
+# --- Hybrid Strategy Parameters (混合策略參數) ---
+use_hybrid_model: false       # 是否啟用混合模式（網格 + 趨勢跟隨）
+dmi_period: 14                # ADX/DMI 指標的計算週期
+adx_strength_threshold: 25    # ADX 閾值。高於此值視為強趨勢，進入趨勢跟隨模式
+trend_trade_equity_pct: "0.4" # 趨勢跟隨時使用的資金比例
+trend_trailing_stop_pct: "0.02" # 趨勢跟隨的追蹤止損百分比（2%）
+trend_cooldown_bars: 240      # 退出趨勢跟隨後的冷卻期（分鐘）
+
+# --- Technical Indicators Parameters (技術指標參數) ---
+macd_fast_period: 12          # MACD 快線週期
+macd_slow_period: 26          # MACD 慢線週期
+macd_signal_period: 9         # MACD 信號線週期
+grid_aggression_threshold: 20 # 網格攻擊性閾值（ADX低於此值時使用攻擊性網格）
+grid_aggression_multiplier: "1.0" # 攻擊性網格的大小倍數
+
 # --- ADX/ATR Dynamic Grid Parameters (For Backtester) ---
 # 新增的參數，用於控制 ADX 濾網和 ATR 動態間距
 use_adx_filter: true          # 是否啟用 ADX 市場狀態濾網
@@ -92,4 +108,7 @@ adx_threshold: 35             # ADX 閾值。高於此值視為趨勢行情，�
 
 use_atr_spacing: true         # 是否啟用 ATR 動態網格間距
 atr_period: 14                # ATR 指標的計算週期
-atr_spacing_multiplier: "0.5" # 網格基礎間距 = ATR * 這個乘數。例如 0.5 代表網格間距為 ATR 的一半
+atr_spacing_multiplier: "0.8" # 網格基礎間距 = ATR * 這個乘數（從0.5提升至0.8，增加間距）
+
+# --- Order Type Optimization (訂單類型優化) ---
+use_post_only_orders: true    # 是否嘗試使用post-only訂單（maker訂單，手續費更低）
