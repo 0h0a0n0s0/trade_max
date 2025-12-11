@@ -36,66 +36,80 @@ def quantize(val: Decimal, precision: str) -> Decimal:
 # --- [V7.5 最終穩健版] 繪圖函數 (無變更) ---
 def plot_backtest_results(price_df: pd.DataFrame, trade_log: List[Dict], output_filename: str = "backtest_results_v9.png"):
     """
-    將回測結果視覺化（穩健版，手動處理X軸標籤以避免 'converter' 錯誤）。
+    將回測結果視覺化（增強版：包含 EMA 與 ADX 指標）。
     """
-    if not trade_log and len(price_df) == 0:
-        LOG.warning("Price data and trade log are empty. Skipping plot generation.")
+    if len(price_df) == 0:
+        LOG.warning("Price data is empty. Skipping plot generation.")
         return
 
-    LOG.info(f"Generating backtest result plot, saving to {output_filename}...")
+    LOG.info(f"Generating enhanced backtest result plot, saving to {output_filename}...")
     
     trade_df = pd.DataFrame(trade_log)
     if not trade_df.empty:
         trade_df['price'] = pd.to_numeric(trade_df['price'])
     
-    # 建立一個從 0 開始的整數索引，用於繪圖
+    # 準備繪圖數據
     plot_indices = range(len(price_df))
     plot_prices = price_df['close'].astype(float)
-
-    fig, ax = plt.subplots(figsize=(20, 10))
-
-    # 1. 繪製價格曲線 (使用整數索引作為 X 軸)
-    ax.plot(plot_indices, plot_prices, label='Close Price', color='skyblue', linewidth=1)
-
-    # 2. 標記交易點 (同樣使用整數索引作為 X 軸)
-    if not trade_df.empty:
-        marker_size_grid, marker_size_trend = 25, 80
-        
-        # 將 trade_log 中的 datetime 索引轉換為對應的整數位置索引
-        trade_df['plot_index'] = trade_df['index'].apply(lambda x: price_df.index.get_loc(x) if x in price_df.index else -1)
-        trade_df = trade_df[trade_df['plot_index'] != -1] # 移除無效的交易點
-
-        grid_buys = trade_df[trade_df['type'] == 'grid_buy']
-        grid_sells = trade_df[trade_df['type'] == 'grid_sell']
-        ax.scatter(grid_buys['plot_index'], grid_buys['price'], label='Grid Buy', marker='^', color='lime', s=marker_size_grid, zorder=5)
-        ax.scatter(grid_sells['plot_index'], grid_sells['price'], label='Grid Sell', marker='v', color='red', s=marker_size_grid, zorder=5)
-        
-        trend_long_entry = trade_df[trade_df['type'] == 'trend_long_entry']
-        trend_short_entry = trade_df[trade_df['type'] == 'trend_short_entry']
-        trend_exit = trade_df[trade_df['type'] == 'trend_exit']
-        ax.scatter(trend_long_entry['plot_index'], trend_long_entry['price'], label='Trend Long Entry', marker='o', color='green', s=marker_size_trend, zorder=10, edgecolors='white')
-        ax.scatter(trend_short_entry['plot_index'], trend_short_entry['price'], label='Trend Short Entry', marker='o', color='maroon', s=marker_size_trend, zorder=10, edgecolors='white')
-        ax.scatter(trend_exit['plot_index'], trend_exit['price'], label='Trend Exit', marker='X', color='blue', s=marker_size_trend, zorder=10)
-
-    # 3. 手動格式化 X 軸標籤
-    # 選取大約 10 個點來顯示日期標籤
-    num_ticks = 10
-    tick_positions = [int(p) for p in np.linspace(0, len(price_df) - 1, num_ticks)]
-    tick_labels = [price_df.index[pos].strftime('%Y-%m-%d') for pos in tick_positions]
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(tick_labels, rotation=30, ha='right')
-
-    # 4. 格式化圖表
-    ax.set_title('Backtest Trading Activity (V9)', fontsize=20)
-    ax.set_xlabel('Date', fontsize=12)
-    ax.set_ylabel('Price (TWD)', fontsize=12)
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    ax.legend(loc='upper left')
     
+    # 設定畫布：兩個子圖 (上圖價格 70%, 下圖 ADX 30%)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+
+    # --- 上圖：價格與 EMA ---
+    ax1.plot(plot_indices, plot_prices, label='Close Price', color='skyblue', linewidth=1, alpha=0.6)
+    
+    # 繪製 EMA (如果存在)
+    if 'ema_fast' in price_df.columns and 'ema_slow' in price_df.columns:
+        ax1.plot(plot_indices, price_df['ema_fast'], label='EMA Fast', color='orange', linewidth=1.5, linestyle='--')
+        ax1.plot(plot_indices, price_df['ema_slow'], label='EMA Slow', color='purple', linewidth=1.5, linestyle='--')
+
+    # 標記交易點
+    if not trade_df.empty:
+        # 將 datetime 索引轉換為整數索引
+        trade_df['plot_index'] = trade_df['index'].apply(lambda x: price_df.index.get_loc(x) if x in price_df.index else -1)
+        valid_trades = trade_df[trade_df['plot_index'] != -1]
+
+        # 網格交易
+        grid_buys = valid_trades[valid_trades['type'] == 'grid_buy']
+        grid_sells = valid_trades[valid_trades['type'] == 'grid_sell']
+        ax1.scatter(grid_buys['plot_index'], grid_buys['price'], label='Grid Buy', marker='^', color='lime', s=30, zorder=5)
+        ax1.scatter(grid_sells['plot_index'], grid_sells['price'], label='Grid Sell', marker='v', color='red', s=30, zorder=5)
+        
+        # 趨勢交易
+        trend_entries = valid_trades[valid_trades['type'].str.contains('entry')]
+        trend_exits = valid_trades[valid_trades['type'] == 'trend_exit']
+        ax1.scatter(trend_entries['plot_index'], trend_entries['price'], label='Trend Entry', marker='o', color='blue', s=100, zorder=10, edgecolors='white', linewidth=2)
+        ax1.scatter(trend_exits['plot_index'], trend_exits['price'], label='Trend Exit', marker='X', color='black', s=100, zorder=10, edgecolors='white', linewidth=2)
+
+    ax1.set_title('Price Action with EMA Trend & Trades', fontsize=14)
+    ax1.set_ylabel('Price (TWD)', fontsize=12)
+    ax1.legend(loc='upper left')
+    ax1.grid(True, linestyle='--', alpha=0.5)
+
+    # --- 下圖：ADX 指標 ---
+    if 'adx' in price_df.columns:
+        ax2.plot(plot_indices, price_df['adx'], label='ADX Strength', color='magenta', linewidth=1.5)
+        # 繪製閾值線 (假設預設 25，可從 config 讀取更好，這裡先寫死或用變數)
+        ax2.axhline(y=25, color='gray', linestyle=':', label='Trend Threshold (25)')
+        ax2.fill_between(plot_indices, price_df['adx'], 25, where=(price_df['adx'] > 25), color='magenta', alpha=0.1)
+    
+    ax2.set_title('ADX Trend Strength', fontsize=12)
+    ax2.set_ylabel('ADX Value', fontsize=12)
+    ax2.set_xlabel('Date', fontsize=12)
+    ax2.legend(loc='upper left')
+    ax2.grid(True, linestyle='--', alpha=0.5)
+
+    # 處理 X 軸標籤
+    num_ticks = 12
+    tick_positions = [int(p) for p in np.linspace(0, len(price_df) - 1, num_ticks)]
+    tick_labels = [price_df.index[pos].strftime('%Y-%m-%d %H:%M') for pos in tick_positions]
+    ax2.set_xticks(tick_positions)
+    ax2.set_xticklabels(tick_labels, rotation=30, ha='right')
+
     plt.tight_layout()
-    plt.savefig(output_filename, dpi=300)
+    plt.savefig(output_filename, dpi=150)
     plt.close()
-    LOG.info("Plot generation complete.")
+    LOG.info(f"Enhanced plot saved to {output_filename}")
 
 
 # --- 核心回測邏輯 ---
@@ -213,9 +227,17 @@ class Backtester:
         LOG.info("Calculating all required indicators for V9 Model...")
         price_series = ohlc_df['close'].ffill()
         
-        ema_f, ema_s = ema(price_series, span=self.ema_fast_span), ema(price_series, span=self.ema_slow_span)
+        # --- [修改開始] 將指標存入 ohlc_df 以便繪圖 ---
+        ema_f = ema(price_series, span=self.ema_fast_span)
+        ema_s = ema(price_series, span=self.ema_slow_span)
         adx_series, _, _ = adx(ohlc_df['high'], ohlc_df['low'], ohlc_df['close'], period=self.dmi_period)
         
+        # 存入 DataFrame
+        ohlc_df['ema_fast'] = ema_f
+        ohlc_df['ema_slow'] = ema_s
+        ohlc_df['adx'] = adx_series
+        # --- [修改結束] ---
+
         initial_price = Decimal(str(price_series.iloc[0]))
         initial_equity = TWD_BALANCE + USDT_BALANCE * initial_price
         

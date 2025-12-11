@@ -10,22 +10,22 @@ qty_precision: "0.001"        # 訂單數量精度 (例如 USDT 為小數點後3
 
 # --- Core Grid Strategy Parameters (同步 backtester_grid.py 邏輯) ---
 # Grid Structure
-small_gap: "0.015"            # 最小網格間距 (TWD)
+small_gap: "0.05"            # 最小網格間距 (TWD)
 mid_mult: 3                   # small_gap 的倍數，用於得到 mid_gap (mid_gap = small_gap * mid_mult)
 big_mult: 7                   # small_gap 的倍數，用於得到 big_gap (big_gap = small_gap * big_mult)
-levels_each: 4                # 每個網格層級在中心價上下各有多少層掛單
+levels_each: 12                # 每個網格層級在中心價上下各有多少層掛單
 
 # Order Sizing (每個層級訂單佔總權益的百分比)
-size_pct_small: "0.015"        # 小間距網格層的訂單
-size_pct_mid: "0.025"          # 中間距網格層的訂單
-size_pct_big: "0.035"          # 大間距網格層的訂單
+size_pct_small: "0.05"        # 小間距網格層的訂單
+size_pct_mid: "0.03"          # 中間距網格層的訂單
+size_pct_big: "0.02"          # 大間距網格層的訂單
 
 # Grid Recenter
-recenter_interval_minutes: 540 # 網格重新置中的間隔時間 (分鐘)。(backtester 使用 8000 根1分鐘bar)
+recenter_interval_minutes: 660 # 網格重新置中的間隔時間 (分鐘)。(backtester 使用 8000 根1分鐘bar)
 
 # --- Trend Following / Directional Bias Parameters (同步 backtester_grid.py 邏輯) ---
-ema_span_fast_bars: 120    # 快速EMA週期 (分鐘) (1分鐘K線下為10小時)
-ema_span_slow_bars: 600   # 慢速EMA週期 (分鐘) (1分鐘K線下為50小時)
+ema_span_fast_bars: 20    # 快速EMA週期 (分鐘) (1分鐘K線下為10小時)
+ema_span_slow_bars: 250   # 慢速EMA週期 (分鐘) (1分鐘K線下為50小時)
 bias_high: "0.60"             # 看漲時的目標USDT曝險比例 (USDT價值 / 總權益)
 bias_low: "0.25"              # 看跌時的目標USDT曝險比例
 bias_neutral_target: "0.40"   # EMA快線 == EMA慢線 (趨勢中性) 時的目標USDT曝險比例
@@ -34,7 +34,7 @@ bias_rebalance_threshold_twd: "1660.0" # 當前曝險與目標曝險差異超過
 bias_rebalance_fraction: "0.25" # 再平衡時，交易目標差異的比例 (例如只補足差異的25%)
 
 # --- Fees and Funding (同步 backtester_grid.py 邏輯) ---
-taker_fee: "0.001"            # 假設的交易手續費 (例如 0.1%)。用於PnL估算和訂單成本計算。
+taker_fee: "0.0004"            # 假設的交易手續費 (例如 0.1%)。用於PnL估算和訂單成本計算。
                               # 注意: MAX 交易所的 maker/taker 手續費可能不同。此處為通用預估。
                               # 實際手續費應從交易所成交回報中獲取。
 funding_rate_hour: "0.0"  # 每小時資金費率。正值 = 多頭支付空頭。
@@ -88,7 +88,7 @@ log_level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
 # 新增的參數，用於控制 ADX 濾網和 ATR 動態間距
 use_adx_filter: False          # 是否啟用 ADX 市場狀態濾網
 adx_period: 14                # ADX 指標的計算週期
-adx_threshold: 35             # ADX 閾值。高於此值視為趨勢行情，將暫停網格交易
+adx_threshold: 30             # ADX 閾值。高於此值視為趨勢行情，將暫停網格交易
 
 use_atr_spacing: False         # 是否啟用 ATR 動態網格間距
 atr_period: 14                # ATR 指標的計算週期

@@ -89,10 +89,10 @@ class OptunaOptimizer:
         cfg = self.base_config.copy()
         
         # 網格參數
-        cfg['small_gap'] = str(trial.suggest_float('small_gap', 0.02, 0.10, step=0.005))
+        cfg['small_gap'] = str(trial.suggest_float('small_gap', 0.03, 0.08, step=0.005))
         cfg['mid_mult'] = trial.suggest_int('mid_mult', 2, 5)
         cfg['big_mult'] = trial.suggest_int('big_mult', 5, 10)
-        cfg['levels_each'] = trial.suggest_int('levels_each', 4, 10)
+        cfg['levels_each'] = trial.suggest_int('levels_each', 8, 16)
         
         # 訂單大小
         cfg['size_pct_small'] = str(trial.suggest_float('size_pct_small', 0.01, 0.05, step=0.005))
@@ -100,15 +100,15 @@ class OptunaOptimizer:
         cfg['size_pct_big'] = str(trial.suggest_float('size_pct_big', 0.03, 0.08, step=0.005))
         
         # EMA參數
-        cfg['ema_span_fast_bars'] = trial.suggest_int('ema_span_fast_bars', 300, 1200, step=60)
-        cfg['ema_span_slow_bars'] = trial.suggest_int('ema_span_slow_bars', 1800, 3600, step=300)
+        cfg['ema_span_fast_bars'] = trial.suggest_int('ema_span_fast_bars', 10, 100, step=10)
+        cfg['ema_span_slow_bars'] = trial.suggest_int('ema_span_slow_bars', 100, 500, step=50)
         
         # 重建間隔
         cfg['recenter_interval_minutes'] = trial.suggest_int('recenter_interval_minutes', 240, 960, step=60)
         
         # 混合模式參數（如果啟用）
         if cfg.get('use_hybrid_model', False):
-            cfg['adx_strength_threshold'] = trial.suggest_int('adx_strength_threshold', 20, 40)
+            cfg['adx_strength_threshold'] = trial.suggest_int('adx_strength_threshold', 25, 40)
             cfg['trend_trade_equity_pct'] = str(trial.suggest_float('trend_trade_equity_pct', 0.3, 0.5, step=0.05))
             cfg['trend_trailing_stop_pct'] = str(trial.suggest_float('trend_trailing_stop_pct', 0.01, 0.03, step=0.005))
         
