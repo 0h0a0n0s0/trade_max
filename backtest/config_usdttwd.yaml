@@ -86,17 +86,18 @@ log_level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
 
 # --- ADX/ATR Dynamic Grid Parameters (For Backtester) ---
 # 新增的參數，用於控制 ADX 濾網和 ATR 動態間距
-use_adx_filter: False          # 是否啟用 ADX 市場狀態濾網
+use_adx_filter: false          # 方向1優化：完全禁用ADX過濾器，讓策略主要依靠趨勢跟隨
 adx_period: 14                # ADX 指標的計算週期
-adx_threshold: 30             # ADX 閾值。高於此值視為趨勢行情，將暫停網格交易
+adx_threshold: 30             # ADX 閾值（已禁用，保留作為參考）
 
-use_atr_spacing: False         # 是否啟用 ATR 動態網格間距
+use_atr_spacing: true          # 是否啟用 ATR 動態網格間距（根據市場波動率自動調整）
 atr_period: 14                # ATR 指標的計算週期
 atr_spacing_multiplier: "0.5" # 網格基礎間距 = ATR * 這個乘數。例如 0.5 代表網格間距為 ATR 的一半
 
 # --- Hybrid Strategy Parameters (V5 - Trend Following Module) ---
+# 方向1優化：完全轉向趨勢跟隨策略
 use_hybrid_model: true          # 是否啟用混合策略模型
-trend_trade_equity_pct: "0.4" # 執行趨勢交易時，投入的資金佔總權益的百分比 (例如 0.4 代表 40%)
+trend_trade_equity_pct: "0.7" # 執行趨勢交易時，投入的資金佔總權益的百分比 (從0.4提升至0.7，更積極)
 trend_trailing_stop_pct: "0.08" # 移動停利的百分比 (例如 0.02 代表 2%)
 
 # 指標週期設定 (MACD & DMI)
@@ -105,10 +106,31 @@ macd_slow_period: 26
 macd_signal_period: 9
 dmi_period: 14                  # DMI (+DI / -DI) 的計算週期
 
+# RSI參數（用於複合條件判斷，第六次優化：調整至業界標準）
+rsi_period: 14                  # RSI計算週期（業界標準）
+rsi_bull_threshold: 50.0        # 多頭RSI門檻（RSI > 此值視為多頭，可優化至50-60）
+rsi_bear_threshold: 50.0        # 空頭RSI門檻（RSI < 此值視為空頭，可優化至40-50）
+
+# 複合條件參數（放寬進場條件）
+use_multi_indicator: true       # 是否使用多指標複合判斷（OR邏輯）
+adx_min_threshold: 6            # 最低ADX門檻（極度放寬，降低進場門檻至6）
+
+# 布林帶參數（第六次優化新增）
+bollinger_window: 20            # 布林帶週期（業界標準）
+bollinger_k: 2.0                # 布林帶標準差倍數（業界標準）
+bollinger_band_threshold: 0.1   # 接近布林帶邊界的閾值（0.1 = 10%，價格在上下10%範圍內視為接近邊界）
+
+# 隨機震盪指標參數（第六次優化新增）
+stochastic_k_period: 14         # 隨機指標K週期（業界標準）
+stochastic_d_period: 3          # 隨機指標D週期（業界標準）
+stochastic_oversold: 30.0       # 超賣門檻（%K < 30視為超賣）
+stochastic_overbought: 70.0     # 超買門檻（%K > 70視為超買）
+
 # 風險控制
 trend_cooldown_bars: 540      # 防挨打一筆趨勢交易結束後，進入冷卻狀態的 K 棒數量 (例如 240 根 1 分鐘 K 線 = 4 小時)
 
 # --- [V6 新增] 三態模型控制參數 ---
-adx_strength_threshold: 15      # ADX趨勢強度濾網：ADX值必須高於此數值，才會觸發趨勢交易
+# 第六次優化：進一步降低趨勢進場門檻，參考業界標準
+adx_strength_threshold: 10      # ADX趨勢強度濾網：可優化至6-12（業界標準20-25，但適應強趨勢市場需降低）
 grid_aggression_threshold: 20   # 積極網格模式的ADX觸發上限：ADX值必須低於此數值，才會進入積極網格模式
 grid_aggression_multiplier: "1.5" # 積極網格模式的資金放大係數 (例如 1.5 代表資金比例放大 50%)

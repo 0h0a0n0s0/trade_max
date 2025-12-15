@@ -86,18 +86,18 @@ class ParameterOptimizer:
         """Generate a random set of parameters within defined ranges"""
         params = self.base_config.copy()
         
-        # Parameter space definitions
-        params['small_gap'] = str(round(random.uniform(0.005, 0.05), 4))
-        params['mid_mult'] = random.randint(2, 5)
-        params['big_mult'] = random.randint(6, 12)
-        params['size_pct_small'] = str(round(random.uniform(0.005, 0.02), 4))
-        params['size_pct_mid'] = str(round(random.uniform(0.01, 0.04), 4))
-        params['size_pct_big'] = str(round(random.uniform(0.02, 0.06), 4))
-        params['ema_span_fast_bars'] = random.randint(60, 800)
-        params['ema_span_slow_bars'] = random.randint(1500, 6000)
-        params['bias_high'] = str(round(random.uniform(0.55, 0.85), 3))
-        params['bias_low'] = str(round(random.uniform(0.10, 0.40), 3))
-        params['bias_neutral_target'] = str(round(random.uniform(0.35, 0.55), 3))
+        # 調整後的參數範圍（擴大搜索空間）
+        params['small_gap'] = str(round(random.uniform(0.01, 0.10), 4))  # 擴大：0.01-0.10
+        params['mid_mult'] = random.randint(2, 6)  # 擴大：2-6
+        params['big_mult'] = random.randint(5, 15)  # 擴大：5-15
+        params['size_pct_small'] = str(round(random.uniform(0.01, 0.05), 4))  # 擴大：0.01-0.05
+        params['size_pct_mid'] = str(round(random.uniform(0.015, 0.06), 4))  # 擴大：0.015-0.06
+        params['size_pct_big'] = str(round(random.uniform(0.02, 0.08), 4))  # 擴大：0.02-0.08
+        params['ema_span_fast_bars'] = random.randint(30, 1200)  # 擴大：30-1200
+        params['ema_span_slow_bars'] = random.randint(600, 8000)  # 擴大：600-8000
+        params['bias_high'] = str(round(random.uniform(0.50, 0.90), 3))  # 擴大：0.50-0.90
+        params['bias_low'] = str(round(random.uniform(0.05, 0.50), 3))  # 擴大：0.05-0.50
+        params['bias_neutral_target'] = str(round(random.uniform(0.30, 0.60), 3))  # 擴大：0.30-0.60
         
         # Ensure required parameters exist
         if 'macd_fast_period' not in params:
@@ -174,8 +174,8 @@ class ParameterOptimizer:
             backtester = Backtester(params, self.init_usdt, self.init_twd, verbose=False)
             stats = backtester.run(self.price_df)
             
-            # Check if results meet criteria
-            if stats['roi_pct'] > 15.0 and stats['max_drawdown_pct'] < 5.0:
+            # 調整後的篩選條件（放寬以找到更多候選參數）
+            if stats['roi_pct'] > 5.0 and stats['max_drawdown_pct'] < 15.0:
                 result = {
                     'params': params,
                     'stats': stats
@@ -292,7 +292,7 @@ def main():
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "optimization_results.csv",
                         help="Output CSV file path")
     parser.add_argument("--target", type=int, default=100, help="Target number of valid parameter sets")
-    parser.add_argument("--max-iter", type=int, default=2000, help="Maximum iterations")
+    parser.add_argument("--max-iter", type=int, default=5000, help="Maximum iterations (default: 5000 for more results)")
     
     args = parser.parse_args()
     
