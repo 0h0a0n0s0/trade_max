@@ -203,13 +203,15 @@ class Backtester:
             LOG.info(f"GRID MODE ({grid_mode}): Rebuilding grid for trend: '{log_trend}' @ {center_price:.3f}")
 
         for layer in self.grid_layers:
-            # ATR動態網格間距
+            # ATR 動態網格間距：與實盤邏輯對齊，優先使用 ATR * multiplier，再依層級倍數放大
             if self.use_atr_spacing and current_atr is not None and current_atr > 0:
-                # 使用ATR計算動態間距
+                # 使用 ATR 計算基礎間距
                 base_gap = current_atr * self.atr_spacing_multiplier
-                # 確保間距不小於最小精度
-                base_gap = max(base_gap, Decimal(self.cfg['price_precision']))
-                # 根據層級應用倍數
+                # 以 small_gap 作為最小間距下限，避免過小導致數值不穩或全部卡在最接近價格
+                min_gap = Decimal(str(self.cfg.get('small_gap', '0.001')))
+                base_gap = max(base_gap, min_gap)
+
+                # 根據層級應用 mid_mult / big_mult 倍數
                 if layer.idx == 0:
                     effective_gap = base_gap
                 elif layer.idx == 1:
@@ -217,7 +219,7 @@ class Backtester:
                 else:
                     effective_gap = base_gap * int(self.cfg.get('big_mult', 5))
             else:
-                # 使用固定間距
+                # 未啟用 ATR 動態間距時，回退到原本固定 gap_abs
                 effective_gap = layer.gap_abs
             
             # 應用網格縮減因子（ADX過濾器）

@@ -86,11 +86,11 @@ def run_single_backtest(args_tuple):
         stats['robustness_score'] = robustness_score
 
         # 使用 Robustness Score 和基本閾值進行篩選
-        # 新條件：ROI > 0.5%, MaxDD < 20%, total_trades > 50, Robustness Score > 10
+        # 新條件：ROI > 0.5%, MaxDD < 40%, total_trades > 20, Robustness Score > 10
         if (
             stats['roi_pct'] > 0.5
-            and stats['max_drawdown_pct'] < 20.0
-            and stats.get('total_trades', 0) > 50
+            and stats['max_drawdown_pct'] < 40.0
+            and stats.get('total_trades', 0) > 20
             and robustness_score > 10.0
         ):
             return {
@@ -98,6 +98,17 @@ def run_single_backtest(args_tuple):
                 'stats': stats,
                 'success': True
             }
+
+        # 輕量級拒絕日誌：每 50 次拒絕輸出一筆，觀察為何失敗
+        # 注意：為了避免多進程競爭，這裡不做嚴格計數，只做機率性輸出
+        import random as _rand
+        if _rand.random() < 0.02:  # 約 2% 的機率輸出
+            LOG.info(
+                "Rejected candidate | ROI: %.2f%% | MaxDD: %.2f%% | Trades: %d",
+                stats['roi_pct'],
+                stats['max_drawdown_pct'],
+                stats.get('total_trades', 0),
+            )
     except Exception as e:
         LOG.warning(f"Backtest failed: {e}")
         import traceback
@@ -174,9 +185,9 @@ class ParameterOptimizerParallel:
         # 方向1優化：重點優化趨勢跟隨參數，網格作為輔助
         # 策略調整：完全轉向趨勢跟隨，網格作為輔助
         
-        # ATR動態網格乘數（網格作為輔助，間距可以稍大）
+        # ATR動態網格乘數（控制動態間距，這裡範圍調低，讓網格更緊密）
         if params.get('use_atr_spacing', False):
-            params['atr_spacing_multiplier'] = str(round(random.uniform(0.5, 1.5), 3))  # 0.5-1.5（網格作為輔助）
+            params['atr_spacing_multiplier'] = str(round(random.uniform(0.1, 0.8), 3))  # 0.1-0.8 更緊的 ATR 間距
         
         # 網格倍數（影響網格層級間距）
         params['mid_mult'] = random.randint(2, 5)  # 擴大：2-5
@@ -198,8 +209,8 @@ class ParameterOptimizerParallel:
         params['bias_low'] = str(round(random.uniform(0.10, 0.45), 3))  # 擴大：0.10-0.45
         params['bias_neutral_target'] = str(round(random.uniform(0.35, 0.60), 3))  # 擴大：0.35-0.60
         
-        # small_gap保留作為備選（如果禁用ATR動態網格）
-        params['small_gap'] = str(round(random.uniform(0.001, 0.01), 4))  # 0.001-0.01
+        # small_gap：在未啟用 ATR 或作為基礎時，控制絕對間距（改為非常緊的網格）
+        params['small_gap'] = str(round(random.uniform(0.0005, 0.003), 4))  # 0.0005-0.003 非常緊的網格
         
         # Ensure required parameters
         if 'macd_fast_period' not in params:
@@ -223,8 +234,11 @@ class ParameterOptimizerParallel:
         if 'atr_spacing_multiplier' not in params:
             params['atr_spacing_multiplier'] = str(round(random.uniform(0.3, 1.5), 3))
 
-        # ADX 趨勢進場門檻：提高到 20-50，避免太早進入趨勢模式（減少 Zombie 行為）
-        params['adx_strength_threshold'] = random.randint(20, 50)
+        # ADX 趨勢進場門檻：保持在 20-60，避免太早進入趨勢模式（減少 Zombie 行為）
+        params['adx_strength_threshold'] = random.randint(20, 60)
+
+        # 每側網格層數：控制在 5-15，避免層數過多導致單筆訂單金額過小
+        params['levels_each'] = random.randint(5, 15)
         
         return params
     
@@ -234,7 +248,10 @@ class ParameterOptimizerParallel:
         
         if 'small_gap' in params:
             val = float(params['small_gap'])
-            params['small_gap'] = str(round(max(0.01, min(0.10, val * (1 + random.uniform(-mutation_rate, mutation_rate)))), 4))
+            # 圍繞 0.0005-0.003 的範圍輕微變動，並限制在此區間內
+            mutated = val * (1 + random.uniform(-mutation_rate, mutation_rate))
+            mutated = max(0.0005, min(0.003, mutated))
+            params['small_gap'] = str(round(mutated, 4))
         
         if 'size_pct_small' in params:
             val = float(params['size_pct_small'])
@@ -306,14 +323,16 @@ class ParameterOptimizerParallel:
             val = float(params['stochastic_overbought'])
             params['stochastic_overbought'] = round(max(65.0, min(75.0, val + random.uniform(-2.0, 2.0))), 1)
         
-        # ATR動態網格乘數變異
+        # ATR動態網格乘數變異（保持在 0.1-0.8 範圍內）
         if 'atr_spacing_multiplier' in params:
             val = float(params['atr_spacing_multiplier'])
-            params['atr_spacing_multiplier'] = str(round(max(0.3, min(1.5, val * (1 + random.uniform(-mutation_rate, mutation_rate)))), 3))
+            mutated = val * (1 + random.uniform(-mutation_rate, mutation_rate))
+            mutated = max(0.1, min(0.8, mutated))
+            params['atr_spacing_multiplier'] = str(round(mutated, 3))
         
-        # 網格層級數量變異
+        # 網格層級數量變異：保持在 5-15 範圍內
         if 'levels_each' in params:
-            params['levels_each'] = max(16, min(24, params['levels_each'] + random.randint(-2, 2)))
+            params['levels_each'] = max(5, min(15, params['levels_each'] + random.randint(-2, 2)))
         
         if 'bias_high' in params:
             val = float(params['bias_high'])
@@ -363,51 +382,67 @@ class ParameterOptimizerParallel:
                 # Run batch in parallel
                 results = pool.map(run_single_backtest, batch_params)
                 
-                # Process results
+                # Process results (診斷模式：收集所有結果，不再過濾)
                 for result in results:
-                    if result and result.get('success'):
-                        self.valid_results.append(result)
-                        stats = result['stats']
-                        robustness = stats.get('robustness_score', 0)
-                        trades = stats.get('total_trades', 0)
-                        total_pnl = stats.get('total_pnl', 0.0)
-                        adx_thr = result['params'].get('adx_strength_threshold', 'NA')
-                        print(f"✅ 找到有效參數 [{len(self.valid_results)}/{self.target_valid_sets}] | "
-                              f"ROI: {stats['roi_pct']:.2f}% | Max DD: {stats['max_drawdown_pct']:.2f}% | "
-                              f"Trades: {trades} | ADX: {adx_thr} | "
-                              f"Total PnL: {total_pnl:.2f} | Robustness: {robustness:.2f}")
+                    if not result or 'stats' not in result or 'params' not in result:
+                        continue
+
+                    self.valid_results.append(result)
+                    stats = result['stats']
+                    params = result['params']
+
+                    robustness = stats.get('robustness_score', 0)
+                    trades = stats.get('total_trades', 0)
+                    total_pnl = stats.get('total_pnl', 0.0)
+                    adx_thr = params.get('adx_strength_threshold', 'NA')
+                    small_gap = float(params.get('small_gap', 0.0))
+
+                    # 每 10 次迭代輸出一次診斷資訊
+                    if self.iteration_count % 10 == 0:
+                        print(
+                            f"[Iter {self.iteration_count}] "
+                            f"Trades: {trades} | ROI: {stats['roi_pct']:.2f}% | "
+                            f"MaxDD: {stats['max_drawdown_pct']:.2f}% | "
+                            f"Gap: {small_gap:.4f} | ADX_Th: {adx_thr} | "
+                            f"Total PnL: {total_pnl:.2f} | Robustness: {robustness:.2f}"
+                        )
                         
-                        # Generate mutations for successful params
+                        # Generate mutations for current params（仍然使用同一套診斷邏輯）
                         if len(self.valid_results) < self.target_valid_sets:
                             mutation_params = []
                             for i in range(5):
                                 if self.iteration_count >= self.max_iterations:
                                     break
-                                mutated = self._mutate_params(result['params'], mutation_rate=0.1)
-                                mutation_params.append((
-                                    mutated,
-                                    float(self.init_usdt),
-                                    float(self.init_twd),
-                                    str(self.csv_path)
-                                ))
+                                mutated = self._mutate_params(params, mutation_rate=0.1)
+                                mutation_params.append(
+                                    (
+                                        mutated,
+                                        float(self.init_usdt),
+                                        float(self.init_twd),
+                                        str(self.csv_path),
+                                    )
+                                )
                                 self.iteration_count += 1
-                            
+
                             # Run mutations in parallel
                             mut_results = pool.map(run_single_backtest, mutation_params)
                             for mut_result in mut_results:
-                                if mut_result and mut_result.get('success'):
-                                    self.valid_results.append(mut_result)
-                                    mut_stats = mut_result['stats']
-                                    mut_robustness = mut_stats.get('robustness_score', 0)
-                                    mut_trades = mut_stats.get('total_trades', 0)
-                                    mut_total_pnl = mut_stats.get('total_pnl', 0.0)
-                                    mut_adx_thr = mut_result['params'].get('adx_strength_threshold', 'NA')
-                                    print(
-                                        f"   └─ 變異成功 | ROI: {mut_stats['roi_pct']:.2f}% | "
-                                        f"Max DD: {mut_stats['max_drawdown_pct']:.2f}% | "
-                                        f"Trades: {mut_trades} | ADX: {mut_adx_thr} | "
-                                        f"Total PnL: {mut_total_pnl:.2f} | Robustness: {mut_robustness:.2f}"
-                                    )
+                                if not mut_result or 'stats' not in mut_result or 'params' not in mut_result:
+                                    continue
+                                self.valid_results.append(mut_result)
+                                mut_stats = mut_result['stats']
+                                mut_params = mut_result['params']
+                                mut_robustness = mut_stats.get('robustness_score', 0)
+                                mut_trades = mut_stats.get('total_trades', 0)
+                                mut_total_pnl = mut_stats.get('total_pnl', 0.0)
+                                mut_adx_thr = mut_params.get('adx_strength_threshold', 'NA')
+                                mut_small_gap = float(mut_params.get('small_gap', 0.0))
+                                print(
+                                    f"   └─ 變異 | Trades: {mut_trades} | ROI: {mut_stats['roi_pct']:.2f}% | "
+                                    f"MaxDD: {mut_stats['max_drawdown_pct']:.2f}% | "
+                                    f"Gap: {mut_small_gap:.4f} | ADX_Th: {mut_adx_thr} | "
+                                    f"Total PnL: {mut_total_pnl:.2f} | Robustness: {mut_robustness:.2f}"
+                                )
                 
                 # Progress update with progress bar
                 elapsed = time.time() - start_time
