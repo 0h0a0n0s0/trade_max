@@ -289,15 +289,24 @@ class GridStrategy:
         elapsed = (current_time - self.last_bias_rebalance_ts).total_seconds()
         return elapsed >= bias_interval
     
-    def get_ema_target_bias(self) -> Decimal:
+    def get_ema_target_bias(self, external_data: Optional[pd.Series] = None) -> Decimal:
         """
         根據EMA快慢線交叉，計算目標USDT曝險比例
+        
+        Args:
+            external_data: 可選的外部數據（pandas Series），用於回測時的向量化計算
         
         Returns:
             Decimal: 目標USDT曝險比例
         """
-        ema_fast = self._calculate_ema_from_history(int(self.params.get("ema_span_fast_bars", 120)))
-        ema_slow = self._calculate_ema_from_history(int(self.params.get("ema_span_slow_bars", 600)))
+        ema_fast = self._calculate_ema_from_history(
+            int(self.params.get("ema_span_fast_bars", 120)),
+            external_data=external_data
+        )
+        ema_slow = self._calculate_ema_from_history(
+            int(self.params.get("ema_span_slow_bars", 600)),
+            external_data=external_data
+        )
         
         if ema_fast is None or ema_slow is None:
             return Decimal(str(self.params.get("bias_neutral_target", "0.40")))
@@ -309,53 +318,133 @@ class GridStrategy:
         else:
             return Decimal(str(self.params.get("bias_neutral_target", "0.40")))
     
-    def _calculate_ema_from_history(self, span: int) -> Optional[Decimal]:
-        """計算EMA指標"""
-        if len(self.price_history) < span / 10 and len(self.price_history) < 10:
-            return None
-        prices = [p[1] for p in self.price_history]
-        series = pd.Series(prices, dtype=float)
-        try:
-            ema_val = series.ewm(span=span, adjust=False).mean().iloc[-1]
-            return Decimal(str(ema_val))
-        except Exception:
-            return None
-    
-    def _calculate_atr_from_history(self, period: int = 14) -> Optional[Decimal]:
-        """計算ATR指標（簡化版）"""
-        if len(self.price_history) < period:
-            return None
-        try:
+    def _calculate_ema_from_history(self, span: int, external_data: Optional[pd.Series] = None) -> Optional[Decimal]:
+        """
+        計算EMA指標
+        
+        Args:
+            span: EMA週期
+            external_data: 可選的外部數據（pandas Series），用於回測時的向量化計算
+        
+        Returns:
+            Optional[Decimal]: EMA值
+        """
+        if external_data is not None:
+            # 使用外部數據（回測模式）
+            try:
+                if len(external_data) < span:
+                    return None
+                ema_val = external_data.ewm(span=span, adjust=False).mean().iloc[-1]
+                return Decimal(str(ema_val))
+            except Exception:
+                return None
+        else:
+            # 使用內部歷史數據（實盤模式）
+            if len(self.price_history) < span / 10 and len(self.price_history) < 10:
+                return None
             prices = [p[1] for p in self.price_history]
             series = pd.Series(prices, dtype=float)
-            high_low = series.rolling(window=period, min_periods=period).max() - \
-                       series.rolling(window=period, min_periods=period).min()
-            atr = high_low.rolling(window=period, min_periods=period).mean()
-            if len(atr) > 0 and not pd.isna(atr.iloc[-1]):
-                return Decimal(str(atr.iloc[-1]))
-            return None
-        except Exception as e:
-            log.warning(f"Failed to calculate ATR: {e}")
-            return None
+            try:
+                ema_val = series.ewm(span=span, adjust=False).mean().iloc[-1]
+                return Decimal(str(ema_val))
+            except Exception:
+                return None
     
-    def _calculate_adx_from_history(self, period: int = 14) -> Optional[Decimal]:
-        """計算ADX指標（簡化版）"""
-        if len(self.price_history) < period * 2:
-            return None
-        try:
-            prices = [p[1] for p in self.price_history]
-            series = pd.Series(prices, dtype=float)
-            price_changes = series.diff().abs()
-            avg_change = price_changes.rolling(window=period, min_periods=period).mean()
-            price_range = series.rolling(window=period, min_periods=period).max() - \
-                         series.rolling(window=period, min_periods=period).min()
-            if len(avg_change) > 0 and price_range.iloc[-1] > 0:
-                adx_approx = (avg_change.iloc[-1] / price_range.iloc[-1]) * 100
-                return Decimal(str(min(max(adx_approx, 0), 100)))
-            return None
-        except Exception as e:
-            log.warning(f"Failed to calculate ADX: {e}")
-            return None
+    def _calculate_atr_from_history(self, period: int = 14, 
+                                     external_high: Optional[pd.Series] = None,
+                                     external_low: Optional[pd.Series] = None,
+                                     external_close: Optional[pd.Series] = None) -> Optional[Decimal]:
+        """
+        計算ATR指標（簡化版）
+        
+        Args:
+            period: ATR週期
+            external_high: 可選的外部高價數據（回測模式）
+            external_low: 可選的外部低價數據（回測模式）
+            external_close: 可選的外部收盤價數據（回測模式）
+        
+        Returns:
+            Optional[Decimal]: ATR值
+        """
+        if external_high is not None and external_low is not None and external_close is not None:
+            # 使用外部數據（回測模式）
+            try:
+                if len(external_high) < period:
+                    return None
+                # 使用 indicators.py 中的 atr 函數
+                from indicators import atr
+                atr_series = atr(external_high, external_low, external_close, period)
+                if len(atr_series) > 0 and not pd.isna(atr_series.iloc[-1]):
+                    return Decimal(str(atr_series.iloc[-1]))
+                return None
+            except Exception as e:
+                log.warning(f"Failed to calculate ATR from external data: {e}")
+                return None
+        else:
+            # 使用內部歷史數據（實盤模式，簡化版）
+            if len(self.price_history) < period:
+                return None
+            try:
+                prices = [p[1] for p in self.price_history]
+                series = pd.Series(prices, dtype=float)
+                high_low = series.rolling(window=period, min_periods=period).max() - \
+                           series.rolling(window=period, min_periods=period).min()
+                atr = high_low.rolling(window=period, min_periods=period).mean()
+                if len(atr) > 0 and not pd.isna(atr.iloc[-1]):
+                    return Decimal(str(atr.iloc[-1]))
+                return None
+            except Exception as e:
+                log.warning(f"Failed to calculate ATR: {e}")
+                return None
+    
+    def _calculate_adx_from_history(self, period: int = 14,
+                                     external_high: Optional[pd.Series] = None,
+                                     external_low: Optional[pd.Series] = None,
+                                     external_close: Optional[pd.Series] = None) -> Optional[Decimal]:
+        """
+        計算ADX指標
+        
+        Args:
+            period: ADX週期
+            external_high: 可選的外部高價數據（回測模式）
+            external_low: 可選的外部低價數據（回測模式）
+            external_close: 可選的外部收盤價數據（回測模式）
+        
+        Returns:
+            Optional[Decimal]: ADX值
+        """
+        if external_high is not None and external_low is not None and external_close is not None:
+            # 使用外部數據（回測模式）
+            try:
+                if len(external_high) < period * 2:
+                    return None
+                # 使用 indicators.py 中的 adx 函數
+                from indicators import adx
+                adx_series, _, _ = adx(external_high, external_low, external_close, period)
+                if len(adx_series) > 0 and not pd.isna(adx_series.iloc[-1]):
+                    return Decimal(str(adx_series.iloc[-1]))
+                return None
+            except Exception as e:
+                log.warning(f"Failed to calculate ADX from external data: {e}")
+                return None
+        else:
+            # 使用內部歷史數據（實盤模式，簡化版）
+            if len(self.price_history) < period * 2:
+                return None
+            try:
+                prices = [p[1] for p in self.price_history]
+                series = pd.Series(prices, dtype=float)
+                price_changes = series.diff().abs()
+                avg_change = price_changes.rolling(window=period, min_periods=period).mean()
+                price_range = series.rolling(window=period, min_periods=period).max() - \
+                             series.rolling(window=period, min_periods=period).min()
+                if len(avg_change) > 0 and price_range.iloc[-1] > 0:
+                    adx_approx = (avg_change.iloc[-1] / price_range.iloc[-1]) * 100
+                    return Decimal(str(min(max(adx_approx, 0), 100)))
+                return None
+            except Exception as e:
+                log.warning(f"Failed to calculate ADX: {e}")
+                return None
     
     def quantize_price(self, price: Decimal) -> Decimal:
         """價格精度量化"""
