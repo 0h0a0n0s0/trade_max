@@ -635,8 +635,7 @@ class BotEngine:
                         self.strategy.last_recenter_ts = now_utc
                 
                 # 8. 資料庫快照（定期）
-                if (now_utc - self.last_db_snapshot_ts).total_seconds() >= 
-                   int(self.strategy.params.get("db_snapshot_interval_sec", 3600)):
+                if (now_utc - self.last_db_snapshot_ts).total_seconds() >= int(self.strategy.params.get("db_snapshot_interval_sec", 3600)):
                     await self._db_log_balance_snapshot()
                     self.last_db_snapshot_ts = now_utc
                 

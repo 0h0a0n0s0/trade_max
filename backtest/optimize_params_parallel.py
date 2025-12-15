@@ -15,7 +15,20 @@ import pandas as pd
 import yaml
 import time
 
-from backtest_adapter import BacktestAdapter
+import sys
+from pathlib import Path
+
+# 添加父目錄到路徑以導入 GridStrategy
+parent_dir = str(Path(__file__).parent.parent)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+# 嘗試兩種導入方式（支持從根目錄或 backtest 目錄運行）
+try:
+    from backtest.backtest_adapter import BacktestAdapter
+except ImportError:
+    from backtest_adapter import BacktestAdapter
+
 from strategy_usdttwd_grid_refactored import GridStrategy
 
 # Setup logging
