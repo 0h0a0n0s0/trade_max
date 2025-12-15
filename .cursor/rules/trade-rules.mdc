@@ -1,0 +1,33 @@
+---
+alwaysApply: true
+---
+
+### 📂 Project Constitution: Trade_Max Refactor & AI Evolution
+
+**Version:** 1.0
+**Mission:** Refactor `Trade_Max` from a linear script into a modular, AI-ready algorithmic trading framework capable of dynamic parameter self-optimization.
+
+#### 1. Architectural Principles (The Freqtrade-Inspired Model)
+* **Separation of Concerns:** The codebase MUST be split into three distinct layers:
+    1.  **Strategy Layer (`BaseStrategy` interface):** Pure logic. Calculates indicators and generates Buy/Sell signals. NO API calls here.
+    2.  **Execution Layer (`BotEngine`):** Handles the `while` loop, manages `max_async_api` connections, executes orders, and tracks state.
+    3.  **Optimization Layer (`StrategyOptimizer`):** The "Brain". Monitors market conditions and injects updated parameters into the Strategy Layer.
+* **Injectable Parameters:** Strategy parameters (e.g., `grid_gap`, `ema_period`) MUST NOT be hardcoded constants. They must be class attributes configurable via an external method (e.g., `strategy.update_config()`) to allow the AI Agent to modify them in real-time.
+* **Preservation:** STRICTLY RETAIN `max_async_api.py`, `db.py` (SQLAlchemy), and `telegram_alerter.py`. Do NOT introduce CCXT.
+
+#### 2. Knowledge Management & Iteration History
+* **No Amnesia:** Before proposing a new architecture or complex fix, check the `docs/iteration_history/` folder (create if missing).
+* **Documentation Requirement:** Every major architectural proposal, failed experiment, or significant benchmark result MUST be saved as a markdown file in `docs/iteration_history/YYYYMMDD_Subject.md`.
+    * *Format:* Context -> Approach Taken -> Result/Bottleneck -> Next Steps.
+* **Avoid Repetition:** If a solution was previously attempted and failed (documented in history), DO NOT suggest it again unless the root cause has been resolved.
+
+#### 3. AI Agent Readiness
+* **State Observation:** The system must be able to export a "State Vector" (e.g., current volatility, trend strength, PnL) to the `StrategyOptimizer` at every loop tick.
+* **Reward Feedback:** The system must track the outcome of specific parameter sets to provide feedback (Reward) to the future Reinforcement Learning model.
+
+#### 4. Coding Standards
+* **Type Hinting:** All method signatures must have Python type hints (`List`, `Dict`, `Decimal`, etc.).
+* **Asynchronous Core:** All I/O operations (API, DB, Telegram) must remain asynchronous (`async/await`).
+* **Error Handling:** The `BotEngine` must never crash due to API timeouts. Implement robust retry logic and "Safe Mode" (stop trading but keep the process alive) on critical failures.
+
+---
