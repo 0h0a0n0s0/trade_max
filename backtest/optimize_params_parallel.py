@@ -42,11 +42,11 @@ LOG = logging.getLogger("ParamOptimizerParallel")
 def run_single_backtest(args_tuple):
     """單個回測任務（用於多進程）- 使用 BacktestAdapter 確保邏輯一致性"""
     params, init_usdt, init_twd, csv_path = args_tuple
-    
+
     try:
         # 在每個進程中重新載入數據（避免序列化問題）
         temp_df = pd.read_csv(csv_path, usecols=['ts', 'high', 'low', 'close'])
-        
+
         # Handle timestamp
         if pd.api.types.is_numeric_dtype(temp_df['ts']):
             try:
@@ -58,13 +58,13 @@ def run_single_backtest(args_tuple):
             temp_df['ts'] = tss
         else:
             temp_df['ts'] = pd.to_datetime(temp_df['ts'])
-        
+
         price_df = temp_df.set_index('ts')
         price_df['high'] = price_df['high'].astype(float)
         price_df['low'] = price_df['low'].astype(float)
         price_df['close'] = price_df['close'].astype(float)
         price_df.ffill(inplace=True)
-        
+
         # 使用 BacktestAdapter 和 GridStrategy（與實盤相同的邏輯）
         strategy = GridStrategy(params)
         adapter = BacktestAdapter(
@@ -74,20 +74,25 @@ def run_single_backtest(args_tuple):
             fee_rate=Decimal(str(params.get('taker_fee', '0.0004'))),
             verbose=False
         )
-        
+
         stats = adapter.run(price_df)
-        
+
         # 計算 Robustness Score（穩健性分數）
         # Formula: score = roi_pct * 0.4 + (100 / (max_drawdown_pct + 1)) * 0.6
         roi_pct = stats['roi_pct']
         max_dd_pct = stats['max_drawdown_pct']
         robustness_score = roi_pct * 0.4 + (100 / (max_dd_pct + 1)) * 0.6
-        
+
         stats['robustness_score'] = robustness_score
-        
+
         # 使用 Robustness Score 和基本閾值進行篩選
-        # 要求：ROI > 0.5%, MaxDD < 15%, Robustness Score > 10
-        if stats['roi_pct'] > 0.5 and stats['max_drawdown_pct'] < 15.0 and robustness_score > 10.0:
+        # 新條件：ROI > 0.5%, MaxDD < 20%, total_trades > 50, Robustness Score > 10
+        if (
+            stats['roi_pct'] > 0.5
+            and stats['max_drawdown_pct'] < 20.0
+            and stats.get('total_trades', 0) > 50
+            and robustness_score > 10.0
+        ):
             return {
                 'params': params,
                 'stats': stats,
@@ -97,7 +102,7 @@ def run_single_backtest(args_tuple):
         LOG.warning(f"Backtest failed: {e}")
         import traceback
         traceback.print_exc()
-    
+
     return {'success': False}
 
 
@@ -217,6 +222,9 @@ class ParameterOptimizerParallel:
             params['use_adx_filter'] = False  # 方向1優化：禁用ADX過濾器，主要依靠趨勢跟隨
         if 'atr_spacing_multiplier' not in params:
             params['atr_spacing_multiplier'] = str(round(random.uniform(0.3, 1.5), 3))
+
+        # ADX 趨勢進場門檻：提高到 20-50，避免太早進入趨勢模式（減少 Zombie 行為）
+        params['adx_strength_threshold'] = random.randint(20, 50)
         
         return params
     
@@ -259,9 +267,12 @@ class ParameterOptimizerParallel:
             val = float(params['trend_trade_equity_pct'])
             params['trend_trade_equity_pct'] = str(round(max(0.6, min(0.85, val * (1 + random.uniform(-mutation_rate, mutation_rate)))), 3))
         
-        # ADX趨勢進場門檻變異（第六次優化：進一步降低）
+        # ADX趨勢進場門檻變異（新範圍：20-50，圍繞較高區間微調）
         if 'adx_strength_threshold' in params:
-            params['adx_strength_threshold'] = max(6, min(12, params['adx_strength_threshold'] + random.randint(-1, 1)))
+            params['adx_strength_threshold'] = max(
+                20,
+                min(50, params['adx_strength_threshold'] + random.randint(-2, 2))
+            )
         
         # 多指標複合判斷參數變異（第六次優化：調整至業界標準）
         if 'rsi_period' in params:
@@ -358,9 +369,13 @@ class ParameterOptimizerParallel:
                         self.valid_results.append(result)
                         stats = result['stats']
                         robustness = stats.get('robustness_score', 0)
+                        trades = stats.get('total_trades', 0)
+                        total_pnl = stats.get('total_pnl', 0.0)
+                        adx_thr = result['params'].get('adx_strength_threshold', 'NA')
                         print(f"✅ 找到有效參數 [{len(self.valid_results)}/{self.target_valid_sets}] | "
                               f"ROI: {stats['roi_pct']:.2f}% | Max DD: {stats['max_drawdown_pct']:.2f}% | "
-                              f"Robustness: {robustness:.2f}")
+                              f"Trades: {trades} | ADX: {adx_thr} | "
+                              f"Total PnL: {total_pnl:.2f} | Robustness: {robustness:.2f}")
                         
                         # Generate mutations for successful params
                         if len(self.valid_results) < self.target_valid_sets:
@@ -384,7 +399,15 @@ class ParameterOptimizerParallel:
                                     self.valid_results.append(mut_result)
                                     mut_stats = mut_result['stats']
                                     mut_robustness = mut_stats.get('robustness_score', 0)
-                                    print(f"   └─ 變異成功 | ROI: {mut_stats['roi_pct']:.2f}% | Max DD: {mut_stats['max_drawdown_pct']:.2f}% | Robustness: {mut_robustness:.2f}")
+                                    mut_trades = mut_stats.get('total_trades', 0)
+                                    mut_total_pnl = mut_stats.get('total_pnl', 0.0)
+                                    mut_adx_thr = mut_result['params'].get('adx_strength_threshold', 'NA')
+                                    print(
+                                        f"   └─ 變異成功 | ROI: {mut_stats['roi_pct']:.2f}% | "
+                                        f"Max DD: {mut_stats['max_drawdown_pct']:.2f}% | "
+                                        f"Trades: {mut_trades} | ADX: {mut_adx_thr} | "
+                                        f"Total PnL: {mut_total_pnl:.2f} | Robustness: {mut_robustness:.2f}"
+                                    )
                 
                 # Progress update with progress bar
                 elapsed = time.time() - start_time
@@ -421,10 +444,10 @@ class ParameterOptimizerParallel:
             print("   3. 檢查數據質量")
             return
         
-        # 使用 Robustness Score 排序（優先考慮穩健性）
+        # 使用 total_pnl 排序（優先考慮「賺最多錢」的策略）
         sorted_results = sorted(
-            self.valid_results, 
-            key=lambda x: x['stats'].get('robustness_score', 0), 
+            self.valid_results,
+            key=lambda x: x['stats']['total_pnl'],
             reverse=True
         )
         
@@ -482,12 +505,16 @@ class ParameterOptimizerParallel:
                 writer.writerows(csv_data)
         
         print(f"\n📊 結果已保存至: {output_file}")
-        print(f"\n🏆 Top 5 參數組合（按 Robustness Score 排序）:")
+        print(f"\n🏆 Top 5 參數組合（按 Total PnL 排序）:")
         for i, result in enumerate(sorted_results[:5], 1):
             stats = result['stats']
             robustness = stats.get('robustness_score', 0)
-            print(f"   {i}. Robustness: {robustness:>6.2f} | ROI: {stats['roi_pct']:>6.2f}% | Max DD: {stats['max_drawdown_pct']:>5.2f}% | "
-                  f"Sharpe: {stats.get('sharpe_ratio', 0):>5.2f} | 交易次數: {stats['total_trades']:>4} | 總損益: {stats['total_pnl']:>10.2f} TWD")
+            print(
+                f"   {i}. Total PnL: {stats['total_pnl']:>10.2f} TWD | "
+                f"ROI: {stats['roi_pct']:>6.2f}% | Max DD: {stats['max_drawdown_pct']:>5.2f}% | "
+                f"Sharpe: {stats.get('sharpe_ratio', 0):>5.2f} | "
+                f"Trades: {stats['total_trades']:>4} | Robustness: {robustness:>6.2f}"
+            )
 
 
 def main():
