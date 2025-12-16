@@ -1,12 +1,21 @@
-# backtester_grid.py (V9 - 優化版: 簡化進場 + 順勢網格)
+# backtester_grid.py 
 import argparse
 import logging
+import json
+import sys
+import os
 from decimal import Decimal, getcontext
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import pandas as pd
 import yaml
 import numpy as np
+
+# Add project root to sys.path to allow importing modules from the parent directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 # --- [V7 新增] 引入繪圖函式庫 ---
 import matplotlib.pyplot as plt
@@ -308,6 +317,32 @@ class Backtester:
                 LOG.info("Calculating all required indicators for V9 Model...")
         price_series = ohlc_df['close'].ffill()
         
+        # --- Pre-flight Profitability Check ---
+        initial_price = Decimal(str(price_series.iloc[0]))
+        round_trip_cost = initial_price * self.fee * Decimal('2')  # Buy + Sell fees
+        safety_buffer = Decimal('1.1')  # 10% safety buffer
+        
+        if len(self.grid_layers) > 0:
+            smallest_gap = self.grid_layers[0].gap_abs
+            min_required_gap = round_trip_cost * safety_buffer
+            
+            if smallest_gap < min_required_gap:
+                LOG.warning(
+                    f"Gap {smallest_gap} is too small for fees {round_trip_cost} "
+                    f"(min required: {min_required_gap}). Skipping."
+                )
+                # Return empty result indicating invalid parameters
+                return {
+                    'trade_log': [],
+                    'total_pnl': 0.0,
+                    'roi_pct': -100.0,
+                    'max_drawdown_pct': 0.0,
+                    'total_trades': 0,
+                    'final_equity': float(TWD_BALANCE + USDT_BALANCE * initial_price),
+                    'initial_equity': float(TWD_BALANCE + USDT_BALANCE * initial_price),
+                    'invalid_params': True
+                }
+        
         # --- [修改開始] 將指標存入 ohlc_df 以便繪圖 ---
         ema_f = ema(price_series, span=self.ema_fast_span)
         ema_s = ema(price_series, span=self.ema_slow_span)
@@ -342,8 +377,7 @@ class Backtester:
         ohlc_df['stochastic_k'] = stochastic_k
         ohlc_df['stochastic_d'] = stochastic_d
         # --- [修改結束] ---
-
-        initial_price = Decimal(str(price_series.iloc[0]))
+        # Note: initial_price already calculated in pre-flight check above
         initial_equity = TWD_BALANCE + USDT_BALANCE * initial_price
         
         self._update_equity(initial_price)
@@ -644,7 +678,8 @@ class Backtester:
             'final_usdt_balance': float(USDT_BALANCE),
             'final_twd_balance': float(TWD_BALANCE),
             'final_price': float(final_price),
-            'pnl': float(pnl)
+            'pnl': float(pnl),
+            'invalid_params': False  # Mark as valid
         }
         
         # 合併診斷數據
@@ -653,62 +688,177 @@ class Backtester:
         
         return stats
 
-# --- main 函數 (無變更) ---
 def main():
-    parser = argparse.ArgumentParser(description="V9 Hybrid Backtester: Simplified Entry & Active Grid")
-    parser.add_argument("--csv", required=True, type=Path, help="Path to OHLC CSV file. Must contain 'ts', 'high', 'low', 'close'.")
-    parser.add_argument("--config", default="config_usdttwd.yaml", type=Path, help="Path to the strategy config YAML file.")
-    parser.add_argument("--init_usdt", default=10000.0, type=float, help="Initial USDT balance.")
-    parser.add_argument("--init_twd", default=300000.0, type=float, help="Initial TWD balance.")
+    """
+    主入口：執行回測並輸出結構化 JSON 結果（診斷模式友好）
+    """
+    parser = argparse.ArgumentParser(
+        description="V9 Hybrid Backtester: Simplified Entry & Active Grid"
+    )
+    parser.add_argument(
+        "--csv",
+        required=True,
+        type=Path,
+        help="Path to OHLC CSV file. Must contain 'ts', 'high', 'low', 'close'.",
+    )
+    parser.add_argument(
+        "--config",
+        default="config_usdttwd.yaml",
+        type=Path,
+        help="Path to the strategy config YAML file.",
+    )
+    parser.add_argument(
+        "--init_usdt", default=10000.0, type=float, help="Initial USDT balance."
+    )
+    parser.add_argument(
+        "--init_twd", default=300000.0, type=float, help="Initial TWD balance."
+    )
     args = parser.parse_args()
 
-    if not args.csv.exists() or not args.config.exists():
-        LOG.error(f"File not found.")
-        return
-        
-    cfg = yaml.safe_load(args.config.read_text())
-    
+    # 預先構建結果摘要，確保 finally 中一定有東西可輸出
+    result_summary: Dict[str, Any] = {
+        "status": "error",
+        "error_message": None,
+        "input": {
+            "csv": str(args.csv),
+            "config": str(args.config),
+            "init_usdt": float(args.init_usdt),
+            "init_twd": float(args.init_twd),
+        },
+        "config_params": {},
+        "trade_count": 0,
+        "total_pnl": 0.0,
+        "roi_pct": 0.0,
+        "note": None,
+    }
+
+    price_df: Optional[pd.DataFrame] = None
+    trade_log: List[Dict[str, Any]] = []
+
     try:
-        temp_df = pd.read_csv(args.csv, usecols=['ts', 'high', 'low', 'close'])
-        if pd.api.types.is_numeric_dtype(temp_df['ts']):
+        if not args.csv.exists() or not args.config.exists():
+            msg = f"File not found. csv={args.csv}, config={args.config}"
+            LOG.error(msg)
+            result_summary["error_message"] = msg
+            return
+
+        cfg = yaml.safe_load(args.config.read_text()) or {}
+
+        # 收集關鍵配置參數（若存在）
+        result_summary["config_params"] = {
+            "small_gap": float(cfg.get("small_gap", 0.0)),
+            "size_pct_small": float(cfg.get("size_pct_small", 0.0)),
+            "min_order_value_twd": float(cfg.get("min_order_value_twd", 0.0)),
+            "levels_each": int(cfg.get("levels_each", 0)),
+            "mid_mult": int(cfg.get("mid_mult", 0)),
+            "big_mult": int(cfg.get("big_mult", 0)),
+        }
+
+        # 讀取並處理 CSV
+        temp_df = pd.read_csv(args.csv, usecols=["ts", "high", "low", "close"])
+        if pd.api.types.is_numeric_dtype(temp_df["ts"]):
             try:
-                tss = pd.to_datetime(temp_df['ts'], unit='ms')
+                tss = pd.to_datetime(temp_df["ts"], unit="ms")
                 if tss.min().year < 2000:
                     raise ValueError("ts likely in seconds, not milliseconds.")
             except (ValueError, pd.errors.OutOfBoundsDatetime):
-                LOG.warning("Could not parse ts as milliseconds, trying seconds...")
-                tss = pd.to_datetime(temp_df['ts'], unit='s')
-            temp_df['ts'] = tss
+                LOG.warning(
+                    "Could not parse ts as milliseconds, trying seconds..."
+                )
+                tss = pd.to_datetime(temp_df["ts"], unit="s")
+            temp_df["ts"] = tss
         else:
-            temp_df['ts'] = pd.to_datetime(temp_df['ts'])
-        price_df = temp_df.set_index('ts')
-        price_df['high'] = price_df['high'].astype(float)
-        price_df['low'] = price_df['low'].astype(float)
-        price_df['close'] = price_df['close'].astype(float)
-        price_df.ffill(inplace=True)
-    except Exception as e:
-        LOG.error(f"A critical error occurred while reading or processing the CSV file: {e}", exc_info=True)
-        return
-    
-    backtester = Backtester(cfg, Decimal(str(args.init_usdt)), Decimal(str(args.init_twd)), verbose=True)
-    result = backtester.run(price_df)
-    trade_log = result['trade_log']
-    
-    if trade_log:
-        try:
-            # 將索引從數字轉換回真實的時間戳
-            processed_trade_log = []
-            for trade in trade_log:
-                if isinstance(trade['index'], int) and trade['index'] < len(price_df.index):
-                     trade['index'] = price_df.index[trade['index']]
-                     processed_trade_log.append(trade)
-                # 可選擇性地處理索引超出範圍的情況，此處選擇忽略
-            trade_log = processed_trade_log
-        except IndexError:
-             LOG.error("An index error occurred during trade log ts conversion. Skipping plot generation.")
-             trade_log = []
+            temp_df["ts"] = pd.to_datetime(temp_df["ts"])
 
-    plot_backtest_results(price_df, trade_log)
+        price_df = temp_df.set_index("ts")
+        price_df["high"] = price_df["high"].astype(float)
+        price_df["low"] = price_df["low"].astype(float)
+        price_df["close"] = price_df["close"].astype(float)
+        price_df.ffill(inplace=True)
+
+        # 執行回測
+        backtester = Backtester(
+            cfg,
+            Decimal(str(args.init_usdt)),
+            Decimal(str(args.init_twd)),
+            verbose=True,
+        )
+        result = backtester.run(price_df)
+        trade_log = result.get("trade_log", [])
+
+        # 統一計算交易統計
+        trade_count = len(trade_log)
+        total_pnl = float(result.get("total_pnl", 0.0))
+        roi_pct = float(result.get("roi_pct", 0.0))
+        
+        # 檢查是否為無效參數（pre-flight check 失敗）
+        if result.get("invalid_params", False):
+            result_summary["status"] = "invalid_params"
+            result_summary["roi_pct"] = -100.0
+            result_summary["total_pnl"] = 0.0
+            result_summary["trade_count"] = 0
+            result_summary["note"] = "gap_too_small_for_fees"
+        else:
+            result_summary["status"] = "success"
+            result_summary["trade_count"] = trade_count
+            result_summary["total_pnl"] = total_pnl
+            result_summary["roi_pct"] = roi_pct
+
+            if trade_count == 0:
+                result_summary["note"] = "no_trades_executed"
+
+        # 原有 trade_log 處理與繪圖邏輯保留
+        if trade_log:
+            try:
+                processed_trade_log: List[Dict[str, Any]] = []
+                for trade in trade_log:
+                    if (
+                        isinstance(trade.get("index"), int)
+                        and price_df is not None
+                        and trade["index"] < len(price_df.index)
+                    ):
+                        trade["index"] = price_df.index[trade["index"]]
+                        processed_trade_log.append(trade)
+                trade_log = processed_trade_log
+            except IndexError:
+                LOG.error(
+                    "An index error occurred during trade log ts conversion. "
+                    "Skipping plot generation."
+                )
+                trade_log = []
+
+        if price_df is not None:
+            plot_backtest_results(price_df, trade_log)
+
+    except Exception as e:
+        # 任何錯誤都記錄並標記為 error
+        LOG.error(
+            f"A critical error occurred during backtest execution: {e}",
+            exc_info=True,
+        )
+        result_summary["status"] = "error"
+        result_summary["error_message"] = str(e)
+        # PnL / ROI 保持為 0
+
+    finally:
+        # 無論成功或失敗，都輸出一行可供外部解析的 JSON
+        try:
+            # 標準化輸出格式：__BACKTEST_RESULT__:{...}
+            output_dict = {
+                "status": result_summary.get("status", "error"),
+                "roi_pct": result_summary.get("roi_pct", 0.0),
+                "total_pnl": result_summary.get("total_pnl", 0.0),
+                "trades": result_summary.get("trade_count", 0),
+                "error": result_summary.get("error_message", result_summary.get("note", ""))
+            }
+            print(
+                "__BACKTEST_RESULT__:"
+                + json.dumps(output_dict, ensure_ascii=False)
+            )
+        except Exception as json_err:  # pragma: no cover - 只在極端情況發生
+            LOG.error(f"Failed to dump result_summary as JSON: {json_err}")
+            # Fallback: 輸出最小化 JSON
+            print('__BACKTEST_RESULT__:{"status":"error","roi_pct":0.0,"total_pnl":0.0,"trades":0,"error":"JSON serialization failed"}')
 
 if __name__ == "__main__":
     main()

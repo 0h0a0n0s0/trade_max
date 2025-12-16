@@ -42,6 +42,9 @@ LOG = logging.getLogger("ParamOptimizerParallel")
 def run_single_backtest(args_tuple):
     """單個回測任務（用於多進程）- 使用 BacktestAdapter 確保邏輯一致性"""
     params, init_usdt, init_twd, csv_path = args_tuple
+    
+    # 保存 params 以便在異常時使用
+    saved_params = params.copy() if params else {}
 
     try:
         # 在每個進程中重新載入數據（避免序列化問題）
@@ -76,45 +79,66 @@ def run_single_backtest(args_tuple):
         )
 
         stats = adapter.run(price_df)
+        
+        # 確保 stats 有所有必要的欄位
+        if 'sharpe_ratio' not in stats:
+            stats['sharpe_ratio'] = 0.0
 
         # 計算 Robustness Score（穩健性分數）
         # Formula: score = roi_pct * 0.4 + (100 / (max_drawdown_pct + 1)) * 0.6
-        roi_pct = stats['roi_pct']
-        max_dd_pct = stats['max_drawdown_pct']
+        roi_pct = stats.get('roi_pct', 0.0)
+        max_dd_pct = stats.get('max_drawdown_pct', 0.0)
         robustness_score = roi_pct * 0.4 + (100 / (max_dd_pct + 1)) * 0.6
 
         stats['robustness_score'] = robustness_score
-
-        # 使用 Robustness Score 和基本閾值進行篩選
-        # 新條件：ROI > 0.5%, MaxDD < 40%, total_trades > 20, Robustness Score > 10
-        if (
+        
+        # 診斷模式：永遠返回完整結果，但標記是否為「有效參數」
+        # 標記狀態：profit vs loss_or_idle
+        status = 'profit' if (stats['roi_pct'] > 0 and stats.get('total_trades', 0) > 0) else 'loss_or_idle'
+        
+        # 判斷是否為「有效參數」（滿足優化目標條件）
+        # 條件：ROI > 0.5%, MaxDD < 40%, total_trades > 20, Robustness Score > 10
+        is_valid = (
             stats['roi_pct'] > 0.5
             and stats['max_drawdown_pct'] < 40.0
             and stats.get('total_trades', 0) > 20
             and robustness_score > 10.0
-        ):
-            return {
-                'params': params,
-                'stats': stats,
-                'success': True
-            }
-
-        # 輕量級拒絕日誌：每 50 次拒絕輸出一筆，觀察為何失敗
-        # 注意：為了避免多進程競爭，這裡不做嚴格計數，只做機率性輸出
-        import random as _rand
-        if _rand.random() < 0.02:  # 約 2% 的機率輸出
-            LOG.info(
-                "Rejected candidate | ROI: %.2f%% | MaxDD: %.2f%% | Trades: %d",
-                stats['roi_pct'],
-                stats['max_drawdown_pct'],
-                stats.get('total_trades', 0),
-            )
+        )
+        
+        return {
+            'params': params,
+            'stats': stats,
+            'status': status,
+            'is_valid': is_valid,  # 標記是否為有效參數（用於優化目標）
+            'success': True  # 只代表「回測成功完成」，不代表策略好壞
+        }
+        
     except Exception as e:
+        # 即使發生異常，也返回一個結果結構（用於診斷）
         LOG.warning(f"Backtest failed: {e}")
         import traceback
         traceback.print_exc()
-
-    return {'success': False}
+        
+        # 返回失敗結果，包含錯誤信息
+        # 估算初始權益（使用傳入的參數）
+        estimated_initial_equity = float(init_usdt) * 30.0 + float(init_twd)
+        return {
+            'params': saved_params,
+            'stats': {
+                'roi_pct': 0.0,
+                'max_drawdown_pct': 0.0,
+                'total_pnl': 0.0,
+                'total_trades': 0,
+                'robustness_score': 0.0,
+                'sharpe_ratio': 0.0,
+                'final_equity': estimated_initial_equity,
+                'initial_equity': estimated_initial_equity,
+            },
+            'status': 'error',
+            'error_message': str(e),
+            'is_valid': False,  # 錯誤結果不算有效參數
+            'success': True  # 標記為「已處理」，以便被收集
+        }
 
 
 class ParameterOptimizerParallel:
@@ -130,7 +154,8 @@ class ParameterOptimizerParallel:
         self.num_workers = num_workers
         self.base_config = {}
         self.price_df = None
-        self.valid_results = []
+        self.valid_results = []  # 只存儲滿足條件的「有效參數」
+        self.all_results = []    # 存儲所有結果（用於診斷和 CSV 保存）
         self.iteration_count = 0
         self.max_iterations = 2000
         self.target_valid_sets = 100
@@ -362,7 +387,8 @@ class ParameterOptimizerParallel:
         batch_size = self.num_workers * 2  # Process in batches
         
         with Pool(processes=self.num_workers) as pool:
-            while len(self.valid_results) < self.target_valid_sets and self.iteration_count < self.max_iterations:
+            while (len(self.valid_results) < self.target_valid_sets and 
+                   self.iteration_count < self.max_iterations):
                 # Generate batch of parameters
                 batch_params = []
                 
@@ -382,14 +408,89 @@ class ParameterOptimizerParallel:
                 # Run batch in parallel
                 results = pool.map(run_single_backtest, batch_params)
                 
-                # Process results (診斷模式：收集所有結果，不再過濾)
-                for result in results:
-                    if not result or 'stats' not in result or 'params' not in result:
-                        continue
+                # 診斷：檢查結果數量
+                if len(results) != len(batch_params):
+                    LOG.warning(f"Result count mismatch: expected {len(batch_params)}, got {len(results)}")
+                
+                # Process results (診斷模式：收集所有結果，但區分有效參數)
+                for idx, result in enumerate(results):
+                    # 更寬鬆的檢查：只要有 result 就嘗試處理
+                    if not result:
+                        LOG.warning(f"Empty result at batch index {idx}, creating default result")
+                        # 即使結果為空，也創建一個默認結果以便診斷
+                        result = {
+                            'params': batch_params[idx][0] if idx < len(batch_params) else {},
+                            'stats': {
+                                'roi_pct': 0.0,
+                                'max_drawdown_pct': 0.0,
+                                'total_pnl': 0.0,
+                                'total_trades': 0,
+                                'robustness_score': 0.0,
+                                'sharpe_ratio': 0.0,
+                                'final_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                                'initial_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                            },
+                            'status': 'error',
+                            'error_message': 'Empty result from pool.map()',
+                            'is_valid': False,
+                            'success': False
+                        }
+                    
+                    # 確保結果有必要的欄位，如果沒有則補全
+                    if 'stats' not in result:
+                        LOG.warning(f"Result missing 'stats', creating default: {result}")
+                        result['stats'] = {
+                            'roi_pct': 0.0,
+                            'max_drawdown_pct': 0.0,
+                            'total_pnl': 0.0,
+                            'total_trades': 0,
+                            'robustness_score': 0.0,
+                            'sharpe_ratio': 0.0,
+                            'final_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                            'initial_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                        }
+                    
+                    if 'params' not in result:
+                        LOG.warning(f"Result missing 'params', using empty dict")
+                        result['params'] = {}
+                    
+                    if 'status' not in result:
+                        result['status'] = 'unknown'
+                    
+                    if 'is_valid' not in result:
+                        result['is_valid'] = False
 
-                    self.valid_results.append(result)
+                    # 所有結果都添加到 all_results（用於診斷和 CSV 保存）
+                    try:
+                        self.all_results.append(result)
+                    except Exception as e:
+                        LOG.error(f"Failed to append result: {e}, result type: {type(result)}")
+                        # 即使追加失敗，也嘗試創建一個最小結果
+                        self.all_results.append({
+                            'params': {},
+                            'stats': {
+                                'roi_pct': 0.0,
+                                'max_drawdown_pct': 0.0,
+                                'total_pnl': 0.0,
+                                'total_trades': 0,
+                                'robustness_score': 0.0,
+                                'sharpe_ratio': 0.0,
+                                'final_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                                'initial_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                            },
+                            'status': 'error',
+                            'error_message': f'Failed to process result: {str(e)}',
+                            'is_valid': False,
+                            'success': False
+                        })
+                    
+                    # 只有滿足條件的才添加到 valid_results（用於優化目標統計）
+                    if result.get('is_valid', False):
+                        self.valid_results.append(result)
+                    
                     stats = result['stats']
                     params = result['params']
+                    status = result.get('status', 'unknown')
 
                     robustness = stats.get('robustness_score', 0)
                     trades = stats.get('total_trades', 0)
@@ -398,17 +499,20 @@ class ParameterOptimizerParallel:
                     small_gap = float(params.get('small_gap', 0.0))
 
                     # 每 10 次迭代輸出一次診斷資訊
-                    if self.iteration_count % 10 == 0:
+                    if len(self.all_results) % 10 == 0:
+                        error_msg = result.get('error_message', '')
+                        error_suffix = f" | ERROR: {error_msg}" if error_msg else ""
+                        is_valid_marker = "✅" if result.get('is_valid', False) else "❌"
                         print(
-                            f"[Iter {self.iteration_count}] "
+                            f"[Iter {len(self.all_results)}] {is_valid_marker} Status: {status} | "
                             f"Trades: {trades} | ROI: {stats['roi_pct']:.2f}% | "
                             f"MaxDD: {stats['max_drawdown_pct']:.2f}% | "
                             f"Gap: {small_gap:.4f} | ADX_Th: {adx_thr} | "
-                            f"Total PnL: {total_pnl:.2f} | Robustness: {robustness:.2f}"
+                            f"Total PnL: {total_pnl:.2f} | Robustness: {robustness:.2f}{error_suffix}"
                         )
                         
-                        # Generate mutations for current params（仍然使用同一套診斷邏輯）
-                        if len(self.valid_results) < self.target_valid_sets:
+                        # Generate mutations for successful params（僅對有交易的結果進行變異）
+                        if len(self.valid_results) < self.target_valid_sets and trades > 0:
                             mutation_params = []
                             for i in range(5):
                                 if self.iteration_count >= self.max_iterations:
@@ -426,10 +530,36 @@ class ParameterOptimizerParallel:
 
                             # Run mutations in parallel
                             mut_results = pool.map(run_single_backtest, mutation_params)
-                            for mut_result in mut_results:
-                                if not mut_result or 'stats' not in mut_result or 'params' not in mut_result:
+                            for mut_idx, mut_result in enumerate(mut_results):
+                                # 更寬鬆的檢查
+                                if not mut_result:
+                                    LOG.warning(f"Empty mutation result at index {mut_idx}")
                                     continue
-                                self.valid_results.append(mut_result)
+                                
+                                # 確保結果有必要的欄位
+                                if 'stats' not in mut_result:
+                                    mut_result['stats'] = {
+                                        'roi_pct': 0.0,
+                                        'max_drawdown_pct': 0.0,
+                                        'total_pnl': 0.0,
+                                        'total_trades': 0,
+                                        'robustness_score': 0.0,
+                                        'sharpe_ratio': 0.0,
+                                        'final_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                                        'initial_equity': float(self.init_usdt) * 30.0 + float(self.init_twd),
+                                    }
+                                if 'params' not in mut_result:
+                                    mut_result['params'] = {}
+                                if 'status' not in mut_result:
+                                    mut_result['status'] = 'unknown'
+                                if 'is_valid' not in mut_result:
+                                    mut_result['is_valid'] = False
+                                
+                                # 所有結果都添加到 all_results
+                                self.all_results.append(mut_result)
+                                # 只有滿足條件的才添加到 valid_results
+                                if mut_result.get('is_valid', False):
+                                    self.valid_results.append(mut_result)
                                 mut_stats = mut_result['stats']
                                 mut_params = mut_result['params']
                                 mut_robustness = mut_stats.get('robustness_score', 0)
@@ -437,11 +567,14 @@ class ParameterOptimizerParallel:
                                 mut_total_pnl = mut_stats.get('total_pnl', 0.0)
                                 mut_adx_thr = mut_params.get('adx_strength_threshold', 'NA')
                                 mut_small_gap = float(mut_params.get('small_gap', 0.0))
+                                mut_status = mut_result.get('status', 'unknown')
+                                mut_error_msg = mut_result.get('error_message', '')
+                                mut_error_suffix = f" | ERROR: {mut_error_msg}" if mut_error_msg else ""
                                 print(
-                                    f"   └─ 變異 | Trades: {mut_trades} | ROI: {mut_stats['roi_pct']:.2f}% | "
+                                    f"   └─ 變異 [{mut_status}] | Trades: {mut_trades} | ROI: {mut_stats['roi_pct']:.2f}% | "
                                     f"MaxDD: {mut_stats['max_drawdown_pct']:.2f}% | "
                                     f"Gap: {mut_small_gap:.4f} | ADX_Th: {mut_adx_thr} | "
-                                    f"Total PnL: {mut_total_pnl:.2f} | Robustness: {mut_robustness:.2f}"
+                                    f"Total PnL: {mut_total_pnl:.2f} | Robustness: {mut_robustness:.2f}{mut_error_suffix}"
                                 )
                 
                 # Progress update with progress bar
@@ -455,7 +588,7 @@ class ParameterOptimizerParallel:
                     bar = '█' * filled + '░' * (bar_length - filled)
                     print(f"\r進度: [{bar}] {progress_pct:.1f}% | "
                           f"迭代: {self.iteration_count}/{self.max_iterations} | "
-                          f"有效: {len(self.valid_results)} | "
+                          f"有效: {len(self.valid_results)}/{len(self.all_results)} | "
                           f"速度: {rate:.1f} iter/s | "
                           f"剩餘: {remaining/60:.1f} min", end='', flush=True)
         
@@ -464,24 +597,45 @@ class ParameterOptimizerParallel:
         print("=" * 80)
         print("✅ 優化完成")
         print(f"   總迭代次數: {self.iteration_count}")
+        print(f"   收集到結果總數: {len(self.all_results)}")
         print(f"   找到有效參數組數: {len(self.valid_results)}")
         print(f"   總耗時: {total_time/60:.1f} 分鐘 ({total_time/3600:.2f} 小時)")
-        print(f"   平均每次迭代: {total_time/self.iteration_count:.2f} 秒")
+        if self.iteration_count > 0:
+            print(f"   平均每次迭代: {total_time/self.iteration_count:.2f} 秒")
         print("=" * 80)
     
     def save_results(self, output_path: Path):
-        """Save all valid results to CSV"""
-        if not self.valid_results:
-            print("\n⚠️  未找到有效參數，無法保存結果")
-            print("   建議：")
-            print("   1. 放寬篩選條件（降低ROI要求或提高MaxDD容忍度）")
-            print("   2. 擴大參數搜索範圍")
-            print("   3. 檢查數據質量")
+        """Save all results to CSV (診斷模式：包含所有結果，包括失敗的)"""
+        if not self.all_results:
+            print("\n⚠️  未收集到任何結果（包括失敗的）")
+            print(f"   診斷信息：")
+            print(f"   - 總迭代次數: {self.iteration_count}")
+            print(f"   - all_results 長度: {len(self.all_results)}")
+            print(f"   - valid_results 長度: {len(self.valid_results)}")
+            print("   可能原因：")
+            print("   1. 所有回測都發生異常且未被捕獲")
+            print("   2. 數據文件無法讀取")
+            print("   3. 配置參數錯誤")
+            print("   4. 多進程通信問題")
+            # 即使沒有結果，也創建一個空的 CSV 文件以便診斷
+            output_file = output_path if not output_path.is_dir() else output_path / 'optimization_results.csv'
+            with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['error', 'iteration_count', 'message'])
+                writer.writeheader()
+                writer.writerow({
+                    'error': 'NO_RESULTS_COLLECTED',
+                    'iteration_count': self.iteration_count,
+                    'message': 'No results were collected during optimization'
+                })
+            print(f"\n📊 已創建空的診斷 CSV: {output_file}")
             return
+        
+        print(f"\n📊 準備保存 {len(self.all_results)} 個結果（包含所有成功和失敗的）...")
+        print(f"   其中有效參數: {len(self.valid_results)} 個")
         
         # 使用 total_pnl 排序（優先考慮「賺最多錢」的策略）
         sorted_results = sorted(
-            self.valid_results,
+            self.all_results,
             key=lambda x: x['stats']['total_pnl'],
             reverse=True
         )
@@ -492,13 +646,16 @@ class ParameterOptimizerParallel:
             stats = result['stats']
             
             row = {
+                'is_valid': result.get('is_valid', False),
+                'status': result.get('status', 'unknown'),
+                'error_message': result.get('error_message', ''),
                 'robustness_score': stats.get('robustness_score', 0),
                 'roi_pct': stats['roi_pct'],
                 'max_drawdown_pct': stats['max_drawdown_pct'],
                 'sharpe_ratio': stats.get('sharpe_ratio', 0),
                 'total_pnl': stats['total_pnl'],
                 'total_trades': stats['total_trades'],
-                'final_equity': stats['final_equity'],
+                'final_equity': stats.get('final_equity', 0),
                 'small_gap': params.get('small_gap', ''),
                 'mid_mult': params.get('mid_mult', ''),
                 'big_mult': params.get('big_mult', ''),
@@ -540,16 +697,64 @@ class ParameterOptimizerParallel:
                 writer.writerows(csv_data)
         
         print(f"\n📊 結果已保存至: {output_file}")
-        print(f"\n🏆 Top 5 參數組合（按 Total PnL 排序）:")
-        for i, result in enumerate(sorted_results[:5], 1):
-            stats = result['stats']
-            robustness = stats.get('robustness_score', 0)
-            print(
-                f"   {i}. Total PnL: {stats['total_pnl']:>10.2f} TWD | "
-                f"ROI: {stats['roi_pct']:>6.2f}% | Max DD: {stats['max_drawdown_pct']:>5.2f}% | "
-                f"Sharpe: {stats.get('sharpe_ratio', 0):>5.2f} | "
-                f"Trades: {stats['total_trades']:>4} | Robustness: {robustness:>6.2f}"
-            )
+        
+        # 統計結果分布
+        status_counts = {}
+        for r in sorted_results:
+            status = r.get('status', 'unknown')
+            status_counts[status] = status_counts.get(status, 0) + 1
+        
+        print(f"\n📈 結果統計:")
+        for status, count in status_counts.items():
+            print(f"   {status}: {count} 個")
+        
+        # 顯示 Top 5 有效參數（按 Total PnL）
+        valid_sorted = sorted(
+            self.valid_results,
+            key=lambda x: x['stats']['total_pnl'],
+            reverse=True
+        )
+        if valid_sorted:
+            print(f"\n🏆 Top 5 有效參數組合（按 Total PnL 排序）:")
+            for i, result in enumerate(valid_sorted[:5], 1):
+                stats = result['stats']
+                robustness = stats.get('robustness_score', 0)
+                print(f"   {i}. Total PnL: {stats['total_pnl']:>10.2f} TWD | "
+                      f"ROI: {stats['roi_pct']:>6.2f}% | Max DD: {stats['max_drawdown_pct']:>5.2f}% | "
+                      f"Sharpe: {stats.get('sharpe_ratio', 0):>5.2f} | "
+                      f"Trades: {stats['total_trades']:>4} | Robustness: {robustness:>6.2f}")
+        else:
+            print(f"\n⚠️  沒有找到有效參數（滿足 ROI > 0.5%, MaxDD < 40%, Trades > 20, Robustness > 10）")
+        
+        # 顯示 Top 5 盈利結果（包括未達標的）
+        profitable_results = [r for r in sorted_results if r['stats']['total_pnl'] > 0 and not r.get('is_valid', False)]
+        if profitable_results:
+            print(f"\n📈 Top 5 盈利但未達標的結果（按 Total PnL 排序）:")
+            for i, result in enumerate(profitable_results[:5], 1):
+                stats = result['stats']
+                robustness = stats.get('robustness_score', 0)
+                print(f"   {i}. Total PnL: {stats['total_pnl']:>10.2f} TWD | "
+                      f"ROI: {stats['roi_pct']:>6.2f}% | Max DD: {stats['max_drawdown_pct']:>5.2f}% | "
+                      f"Trades: {stats['total_trades']:>4} | Robustness: {robustness:>6.2f}")
+        
+        # 顯示失敗案例（如果有）
+        error_results = [r for r in sorted_results if r.get('status') == 'error']
+        if error_results:
+            print(f"\n❌ 失敗案例（前 5 個）:")
+            for i, result in enumerate(error_results[:5], 1):
+                error_msg = result.get('error_message', 'Unknown error')
+                print(f"   {i}. Error: {error_msg[:100]}...")
+        
+        # 顯示無交易案例（如果有）
+        no_trade_results = [r for r in sorted_results if r['stats']['total_trades'] == 0 and r.get('status') != 'error']
+        if no_trade_results:
+            print(f"\n💤 無交易案例（前 5 個）:")
+            for i, result in enumerate(no_trade_results[:5], 1):
+                params = result['params']
+                stats = result['stats']
+                print(f"   {i}. Gap: {params.get('small_gap', 'N/A')} | "
+                      f"ADX_Th: {params.get('adx_strength_threshold', 'N/A')} | "
+                      f"ROI: {stats['roi_pct']:.2f}% | MaxDD: {stats['max_drawdown_pct']:.2f}%")
 
 
 def main():
