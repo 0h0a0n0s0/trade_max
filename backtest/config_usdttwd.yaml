@@ -34,7 +34,7 @@ bias_rebalance_threshold_twd: "1660.0" # 當前曝險與目標曝險差異超過
 bias_rebalance_fraction: "0.25" # 再平衡時，交易目標差異的比例 (例如只補足差異的25%)
 
 # --- Fees and Funding (同步 backtester_grid.py 邏輯) ---
-taker_fee: "0.0004"            # 假設的交易手續費 (例如 0.1%)。用於PnL估算和訂單成本計算。
+taker_fee: "0.0002"            # Hardcoded Maker Fee: 0.02% (Lowest tier)
                               # 注意: MAX 交易所的 maker/taker 手續費可能不同。此處為通用預估。
                               # 實際手續費應從交易所成交回報中獲取。
 funding_rate_hour: "0.0"  # 每小時資金費率。正值 = 多頭支付空頭。
@@ -97,7 +97,7 @@ atr_spacing_multiplier: "0.5" # 網格基礎間距 = ATR * 這個乘數。例如
 # --- Hybrid Strategy Parameters (V5 - Trend Following Module) ---
 # 方向1優化：完全轉向趨勢跟隨策略
 use_hybrid_model: true          # 是否啟用混合策略模型
-trend_trade_equity_pct: "0.7" # 執行趨勢交易時，投入的資金佔總權益的百分比 (從0.4提升至0.7，更積極)
+trend_trade_equity_pct: "0.5" # 執行趨勢交易時，投入的資金佔總權益的百分比 (降低至0.5以避免現金陷阱)
 trend_trailing_stop_pct: "0.08" # 移動停利的百分比 (例如 0.02 代表 2%)
 
 # 指標週期設定 (MACD & DMI)

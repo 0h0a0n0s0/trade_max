@@ -123,9 +123,10 @@ def plot_backtest_results(price_df: pd.DataFrame, trade_log: List[Dict], output_
 
 # --- 核心回測邏輯 ---
 class Backtester:
-    def __init__(self, cfg: dict, init_usdt: Decimal, init_twd: Decimal, verbose: bool = True):
+    def __init__(self, cfg: dict, init_usdt: Decimal, init_twd: Decimal, verbose: bool = True, strategy_mode: str = 'hybrid'):
         self.cfg = cfg
         self.verbose = verbose
+        self.strategy_mode = strategy_mode  # 'hybrid', 'pure_grid', 'pure_trend'
         self.fee = Decimal(cfg['taker_fee'])
         self.min_order_value_twd = Decimal(cfg['min_order_value_twd'])
         self.grid_layers: List[GridLayer] = self._setup_grid_layers(cfg)
@@ -168,7 +169,7 @@ class Backtester:
         global USDT_BALANCE, TWD_BALANCE, TOTAL_EQUITY_TWD
         USDT_BALANCE = init_usdt; TWD_BALANCE = init_twd; TOTAL_EQUITY_TWD = TWD_BALANCE
         if self.verbose:
-            LOG.info("Backtester V9 Initialized: Simplified Entry & Active Grid.")
+            LOG.info(f"Backtester V9 Initialized: Strategy Mode = {self.strategy_mode}")
             if self.use_hybrid: LOG.info(f"Hybrid mode ENABLED. Trend ADX Filter: >{self.adx_strength_threshold}, Aggressive Grid: <{self.grid_aggression_threshold}")
 
     def _setup_grid_layers(self, cfg: dict) -> List[GridLayer]:
@@ -181,10 +182,15 @@ class Backtester:
         global TOTAL_EQUITY_TWD; TOTAL_EQUITY_TWD = TWD_BALANCE + USDT_BALANCE * price
 
     def _place_grid_order(self, side: str, price: Decimal, qty: Decimal):
-        # (此函數無變更)
         global ACTIVE_ORDERS
-        if (price * qty) < self.min_order_value_twd: return
+        order_val = price * qty
+        if order_val < self.min_order_value_twd:
+            LOG.warning(
+                f"ORDER REJECTED: Price={price} * Qty={qty} = {order_val} < Min {self.min_order_value_twd}"
+            )
+            return
         ACTIVE_ORDERS[f"{side}_{price}"] = {"price": price, "qty": qty, "side": side}
+        LOG.info(f"DEBUG: Placed {side} order at {price} qty {qty}")
         
     # --- V9 修改 ---
     # 新增 `trend_override` 參數以支援順勢網格
@@ -210,6 +216,9 @@ class Backtester:
             if is_trend_following:
                 log_trend = f"TREND FOLLOWING ({trend_override.upper()})"
             LOG.info(f"GRID MODE ({grid_mode}): Rebuilding grid for trend: '{log_trend}' @ {center_price:.3f}")
+        
+        # DEBUG: Log equity and center price before loop
+        LOG.info(f"DEBUG: Equity={TOTAL_EQUITY_TWD}, CenterPrice={center_price}")
 
         for layer in self.grid_layers:
             # ATR 動態網格間距：與實盤邏輯對齊，優先使用 ATR * multiplier，再依層級倍數放大
@@ -234,7 +243,11 @@ class Backtester:
             # 應用網格縮減因子（ADX過濾器）
             effective_size_pct = layer.size_pct * size_multiplier * grid_reduction_factor
             qty = quantize(effective_size_pct * TOTAL_EQUITY_TWD / center_price, self.cfg['qty_precision'])
-            if qty <= 0: continue
+            # DEBUG: Log calculated size and qty
+            LOG.info(f"DEBUG: Layer={layer.idx}, SizePct={effective_size_pct}, CalcQty={qty}")
+            if qty <= 0:
+                LOG.warning(f"DEBUG: Skipping layer {layer.idx} - qty <= 0")
+                continue
             
             # 應用網格縮減：減少層級數量
             base_levels = layer.levels_each_side
@@ -259,8 +272,27 @@ class Backtester:
         # (此函數邏輯無變更，但會在每一次迴圈被呼叫)
         global ACTIVE_ORDERS, USDT_BALANCE, TWD_BALANCE
         filled_keys, new_orders = [], []
+        
+        # DEBUG: Log active orders count and current price at the beginning
+        LOG.info(f"DEBUG: Bar {bar_index} | Price {price} | Active Orders: {len(ACTIVE_ORDERS)}")
+        
+        # DEBUG: Check if ACTIVE_ORDERS is empty (log once every 100 bars to avoid noise)
+        if len(ACTIVE_ORDERS) == 0 and bar_index % 100 == 0:
+            LOG.warning(f"NO ACTIVE ORDERS in grid! Strategy is idle. (Bar {bar_index})")
+        
         for key, order in ACTIVE_ORDERS.items():
             order_price, order_qty = order['price'], order['qty']
+            
+            # DEBUG: Check for near misses (price close to order but condition not met)
+            if order['side'] == 'buy':
+                diff = price - order_price
+                if price > order_price and abs(diff) < self.grid_layers[0].gap_abs:
+                    LOG.info(f"DEBUG: Near miss! Price {price} vs Buy Order {order_price} (Diff: {diff})")
+            elif order['side'] == 'sell':
+                diff = order_price - price
+                if price < order_price and abs(diff) < self.grid_layers[0].gap_abs:
+                    LOG.info(f"DEBUG: Near miss! Price {price} vs Sell Order {order_price} (Diff: {diff})")
+            
             if order['side'] == 'buy' and price <= order_price:
                 cost = order_price * order_qty
                 if TWD_BALANCE >= cost:
@@ -299,6 +331,10 @@ class Backtester:
         trade_log = []
         equity_history = []
         
+        # Initialize benchmark variables early to avoid UnboundLocalError
+        bh_roi_pct = Decimal("0.0")
+        alpha_pct = Decimal("0.0")
+        
         # 診斷數據收集初始化
         diagnostic_stats = {
             'total_fee_cost': 0.0,
@@ -332,6 +368,11 @@ class Backtester:
                     f"(min required: {min_required_gap}). Skipping."
                 )
                 # Return empty result indicating invalid parameters
+                # Still calculate Buy & Hold for benchmark comparison
+                final_price_for_bh = Decimal(str(price_series.iloc[-1]))
+                bh_roi_pct = float(((final_price_for_bh - initial_price) / initial_price) * 100) if initial_price > 0 else 0.0
+                alpha_pct = -100.0 - bh_roi_pct  # Strategy ROI is -100%, so alpha is negative
+                
                 return {
                     'trade_log': [],
                     'total_pnl': 0.0,
@@ -340,6 +381,10 @@ class Backtester:
                     'total_trades': 0,
                     'final_equity': float(TWD_BALANCE + USDT_BALANCE * initial_price),
                     'initial_equity': float(TWD_BALANCE + USDT_BALANCE * initial_price),
+                    'initial_price': float(initial_price),
+                    'final_price': float(final_price_for_bh),
+                    'bh_roi_pct': bh_roi_pct,
+                    'alpha_pct': alpha_pct,
                     'invalid_params': True
                 }
         
@@ -402,11 +447,22 @@ class Backtester:
                 diagnostic_stats['price_min'] = min(diagnostic_stats['price_min'], price_float)
                 diagnostic_stats['price_max'] = max(diagnostic_stats['price_max'], price_float)
             
-            # --- V9 修改: 網格檢查永遠執行 ---
-            self._check_grid_fills(price, i, trade_log, diagnostic_stats)
+            # --- Strategy Mode Logic ---
+            # Force strategy state based on mode
+            if self.strategy_mode == 'pure_grid':
+                self.strategy_state = 'GRID'  # Force GRID mode, disable trend entry
+            elif self.strategy_mode == 'pure_trend':
+                # In pure_trend mode, skip all grid operations
+                # Only execute trend entry/exit logic
+                pass
+            # else: 'hybrid' mode uses existing logic
+            
+            # --- V9 修改: 網格檢查永遠執行 (unless pure_trend mode) ---
+            if self.strategy_mode != 'pure_trend':
+                self._check_grid_fills(price, i, trade_log, diagnostic_stats)
 
-            # 判斷網格是否需要重建
-            if i > 0 and i % recenter_interval == 0:
+            # 判斷網格是否需要重建 (skip in pure_trend mode)
+            if self.strategy_mode != 'pure_trend' and i > 0 and i % recenter_interval == 0:
                 trend = 'neutral'
                 if ema_f.iloc[i] > ema_s.iloc[i]: trend = 'up'
                 elif ema_f.iloc[i] < ema_s.iloc[i]: trend = 'down'
@@ -423,7 +479,8 @@ class Backtester:
 
             # --- 狀態機邏輯 ---
             # 多指標複合判斷：使用OR邏輯放寬進場條件
-            if self.strategy_state == 'GRID':
+            # Skip trend entry logic in pure_grid mode
+            if self.strategy_state == 'GRID' and self.strategy_mode != 'pure_grid':
                 if self.use_hybrid and self.cooldown_counter == 0:
                     is_ema_bull = ema_f.iloc[i] > ema_s.iloc[i]
                     is_ema_bear = ema_f.iloc[i] < ema_s.iloc[i]
@@ -499,40 +556,74 @@ class Backtester:
                     elif is_strong_downtrend: trend_side = 'sell'
 
                     if trend_side:
-                        self.strategy_state = 'TREND_FOLLOWING'
-                        if diagnostic_stats is not None:
-                            diagnostic_stats['trend_entries'] += 1
-                        if self.verbose:
-                            if self.verbose:
-                                LOG.warning(f"--- Bar {i} | Price {price:.3f} | Trend Entry Signal ---")
-                                LOG.warning(f"    - EMA={'BULL' if is_ema_bull else 'BEAR'}, ADX={current_adx:.2f} (> {self.adx_strength_threshold})")
-
-                        # 清空網格，準備趨勢單
-                        ACTIVE_ORDERS.clear()
+                        # Calculate first: Determine required trade value and quantity
                         trade_value_twd = TOTAL_EQUITY_TWD * self.trend_equity_pct
                         
                         if trend_side == 'buy':
                             qty_to_buy = quantize(trade_value_twd / price, self.cfg['qty_precision'])
-                            if TWD_BALANCE >= trade_value_twd:
-                                TWD_BALANCE -= qty_to_buy * price * (1 + self.fee); USDT_BALANCE += qty_to_buy
+                            required_cost = qty_to_buy * price * (1 + self.fee)
+                            
+                            # Check balance BEFORE taking any action
+                            if TWD_BALANCE >= required_cost:
+                                # Balance sufficient: Proceed with trend trade
+                                self.strategy_state = 'TREND_FOLLOWING'
+                                if diagnostic_stats is not None:
+                                    diagnostic_stats['trend_entries'] += 1
+                                if self.verbose:
+                                    LOG.warning(f"--- Bar {i} | Price {price:.3f} | Trend Entry Signal ---")
+                                    LOG.warning(f"    - EMA={'BULL' if is_ema_bull else 'BEAR'}, ADX={current_adx:.2f} (> {self.adx_strength_threshold})")
+                                
+                                # Clear grid and execute trade
+                                ACTIVE_ORDERS.clear()
+                                TWD_BALANCE -= required_cost
+                                USDT_BALANCE += qty_to_buy
                                 self.trend_position = {'side': 'long', 'entry_price': price, 'qty': qty_to_buy, 'peak_price': price}
                                 trade_log.append({'index': i, 'price': price, 'type': 'trend_long_entry'})
                                 if self.verbose:
-                                    if self.verbose:
-                                        LOG.info(f"    -> ACTION: Entered LONG position: {qty_to_buy:.4f} USDT @ {price:.3f}")
-                                # 立即建立順勢網格
+                                    LOG.info(f"    -> ACTION: Entered LONG position: {qty_to_buy:.4f} USDT @ {price:.3f}")
+                                # Immediately rebuild grid with trend override
                                 self._rebuild_grid(price, 'up', current_adx, trend_override='long', current_atr=current_atr)
-                        else:
+                            else:
+                                # Balance insufficient: Stay in GRID mode
+                                LOG.warning(
+                                    f"Trend Signal Valid but Insufficient Cash. Needed {required_cost:.2f} TWD, "
+                                    f"Have {TWD_BALANCE:.2f} TWD. Staying in GRID mode."
+                                )
+                                # DO NOT clear ACTIVE_ORDERS
+                                # DO NOT change state
+                                # Continue to next iteration (let grid keep running)
+                        else:  # trend_side == 'sell'
                             qty_to_sell = quantize(trade_value_twd / price, self.cfg['qty_precision'])
+                            
+                            # Check balance BEFORE taking any action
                             if USDT_BALANCE >= qty_to_sell:
-                                USDT_BALANCE -= qty_to_sell; TWD_BALANCE += qty_to_sell * price * (1 - self.fee)
+                                # Balance sufficient: Proceed with trend trade
+                                self.strategy_state = 'TREND_FOLLOWING'
+                                if diagnostic_stats is not None:
+                                    diagnostic_stats['trend_entries'] += 1
+                                if self.verbose:
+                                    LOG.warning(f"--- Bar {i} | Price {price:.3f} | Trend Entry Signal ---")
+                                    LOG.warning(f"    - EMA={'BULL' if is_ema_bull else 'BEAR'}, ADX={current_adx:.2f} (> {self.adx_strength_threshold})")
+                                
+                                # Clear grid and execute trade
+                                ACTIVE_ORDERS.clear()
+                                USDT_BALANCE -= qty_to_sell
+                                TWD_BALANCE += qty_to_sell * price * (1 - self.fee)
                                 self.trend_position = {'side': 'short', 'entry_price': price, 'qty': qty_to_sell, 'valley_price': price}
                                 trade_log.append({'index': i, 'price': price, 'type': 'trend_short_entry'})
                                 if self.verbose:
-                                    if self.verbose:
-                                        LOG.info(f"    -> ACTION: Entered SHORT position: {qty_to_sell:.4f} USDT @ {price:.3f}")
-                                # 立即建立順勢網格
+                                    LOG.info(f"    -> ACTION: Entered SHORT position: {qty_to_sell:.4f} USDT @ {price:.3f}")
+                                # Immediately rebuild grid with trend override
                                 self._rebuild_grid(price, 'down', current_adx, trend_override='short', current_atr=current_atr)
+                            else:
+                                # Balance insufficient: Stay in GRID mode
+                                LOG.warning(
+                                    f"Trend Signal Valid but Insufficient Cash. Needed {qty_to_sell:.4f} USDT, "
+                                    f"Have {USDT_BALANCE:.4f} USDT. Staying in GRID mode."
+                                )
+                                # DO NOT clear ACTIVE_ORDERS
+                                # DO NOT change state
+                                # Continue to next iteration (let grid keep running)
 
             elif self.strategy_state == 'TREND_FOLLOWING':
                 if not self.trend_position:
@@ -613,7 +704,16 @@ class Backtester:
         
         final_equity = TWD_BALANCE + USDT_BALANCE * final_price
         pnl = final_equity - initial_equity
-        roi_pct = (pnl / initial_equity) * 100 if initial_equity > 0 else 0
+        roi_pct = (pnl / initial_equity) * 100 if initial_equity > 0 else Decimal("0.0")
+        
+        # Calculate Buy & Hold ROI for benchmark comparison (BEFORE logging)
+        if initial_price > 0:
+            bh_roi_pct = ((final_price - initial_price) / initial_price) * 100
+        else:
+            bh_roi_pct = Decimal("0.0")
+        
+        # Calculate Alpha (Strategy ROI - Buy & Hold ROI)
+        alpha_pct = roi_pct - bh_roi_pct
         
         # Calculate max drawdown
         if len(equity_history) > 0:
@@ -634,10 +734,11 @@ class Backtester:
                 LOG.info(f"Initial Equity: {initial_equity:,.2f} TWD")
                 LOG.info(f"Final Equity:   {final_equity:,.2f} TWD")
                 LOG.info(f"Total PNL:      {pnl:,.2f} TWD")
-                LOG.info(f"Total ROI:      {roi_pct:.2f}%")
+                LOG.info(f"Total ROI:      {float(roi_pct):.2f}%")
                 LOG.info(f"Max Drawdown:   {max_drawdown_pct:.2f}%")
                 LOG.info(f"Total Trades:   {total_trades}")
                 LOG.info(f"Final Balance:  {USDT_BALANCE:.2f} USDT, {TWD_BALANCE:,.2f} TWD")
+                LOG.info(f"[Benchmark] Buy & Hold ROI: {float(bh_roi_pct):.2f}% | Strategy Alpha: {float(alpha_pct):.2f}%")
         
         # 計算診斷指標
         if diagnostic_stats is not None:
@@ -678,7 +779,10 @@ class Backtester:
             'final_usdt_balance': float(USDT_BALANCE),
             'final_twd_balance': float(TWD_BALANCE),
             'final_price': float(final_price),
+            'initial_price': float(initial_price),
             'pnl': float(pnl),
+            'bh_roi_pct': float(bh_roi_pct),
+            'alpha_pct': float(alpha_pct),
             'invalid_params': False  # Mark as valid
         }
         
@@ -712,6 +816,12 @@ def main():
     )
     parser.add_argument(
         "--init_twd", default=300000.0, type=float, help="Initial TWD balance."
+    )
+    parser.add_argument(
+        "--strategy-mode",
+        choices=['hybrid', 'pure_grid', 'pure_trend'],
+        default='hybrid',
+        help="Strategy execution mode: 'hybrid' (default), 'pure_grid' (grid only), 'pure_trend' (trend only)"
     )
     args = parser.parse_args()
 
@@ -777,11 +887,15 @@ def main():
         price_df.ffill(inplace=True)
 
         # 執行回測
+        strategy_mode = getattr(args, 'strategy_mode', 'hybrid')
+        LOG.info(f"Strategy Mode: {strategy_mode}")
+        
         backtester = Backtester(
             cfg,
             Decimal(str(args.init_usdt)),
             Decimal(str(args.init_twd)),
             verbose=True,
+            strategy_mode=strategy_mode,
         )
         result = backtester.run(price_df)
         trade_log = result.get("trade_log", [])
@@ -790,6 +904,8 @@ def main():
         trade_count = len(trade_log)
         total_pnl = float(result.get("total_pnl", 0.0))
         roi_pct = float(result.get("roi_pct", 0.0))
+        bh_roi_pct = float(result.get("bh_roi_pct", 0.0))
+        alpha_pct = float(result.get("alpha_pct", 0.0))
         
         # 檢查是否為無效參數（pre-flight check 失敗）
         if result.get("invalid_params", False):
@@ -797,12 +913,16 @@ def main():
             result_summary["roi_pct"] = -100.0
             result_summary["total_pnl"] = 0.0
             result_summary["trade_count"] = 0
+            result_summary["bh_roi_pct"] = bh_roi_pct
+            result_summary["alpha_pct"] = alpha_pct
             result_summary["note"] = "gap_too_small_for_fees"
         else:
             result_summary["status"] = "success"
             result_summary["trade_count"] = trade_count
             result_summary["total_pnl"] = total_pnl
             result_summary["roi_pct"] = roi_pct
+            result_summary["bh_roi_pct"] = bh_roi_pct
+            result_summary["alpha_pct"] = alpha_pct
 
             if trade_count == 0:
                 result_summary["note"] = "no_trades_executed"
@@ -849,6 +969,8 @@ def main():
                 "roi_pct": result_summary.get("roi_pct", 0.0),
                 "total_pnl": result_summary.get("total_pnl", 0.0),
                 "trades": result_summary.get("trade_count", 0),
+                "bh_roi_pct": result_summary.get("bh_roi_pct", 0.0),
+                "alpha_pct": result_summary.get("alpha_pct", 0.0),
                 "error": result_summary.get("error_message", result_summary.get("note", ""))
             }
             print(

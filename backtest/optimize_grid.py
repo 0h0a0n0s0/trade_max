@@ -3,6 +3,16 @@
 Intelligent Grid Parameter Optimization using Optuna
 Searches only within mathematically profitable parameter ranges
 Saves ALL trial results to CSV for analysis
+
+Recommended execution command (4-core optimization):
+    python backtest/optimize_grid.py \
+        --csv backtest/usdttwd_1m_2025.csv \
+        --config backtest/config_usdttwd.yaml \
+        --strategy-mode pure_grid \
+        --n-jobs 4 \
+        --n-trials 100 \
+        --output-yaml backtest/best_params.yaml \
+        --output-csv backtest/optimization_results.csv
 """
 import argparse
 import json
@@ -17,19 +27,69 @@ import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 
-def objective(trial: optuna.Trial, csv_path: Path, base_config_path: Path, 
-              init_usdt: float, init_twd: float) -> float:
+def objective(
+    trial: optuna.Trial,
+    csv_path: Path,
+    base_config_path: Path,
+    init_usdt: float,
+    init_twd: float,
+    strategy_mode: str = 'hybrid',
+    min_gap: float = 0.05,
+    max_gap: float = 0.3,
+    min_bias_rebalance: float = 100.0,
+    max_bias_rebalance: float = 5000.0,
+) -> float:
     """
     Objective function for Optuna optimization.
     Returns ROI percentage (to be maximized).
     """
-    # Define search space (CRITICAL: Only profitable ranges)
-    small_gap = trial.suggest_float("small_gap", 0.1, 1.5)  # TWD, strictly >= 0.1
-    mid_mult = trial.suggest_int("mid_mult", 2, 5)
-    big_mult = trial.suggest_int("big_mult", 6, 12)
-    size_pct_small = trial.suggest_float("size_pct_small", 0.01, 0.05)
-    ema_span_fast = trial.suggest_int("ema_span_fast_bars", 60, 300)
-    ema_span_slow = trial.suggest_int("ema_span_slow_bars", 400, 3000)
+    # Define search space (CRITICAL: Aggressive profitability optimization)
+    # Force pure_grid mode for high-frequency trading
+    if strategy_mode == 'pure_grid' or True:  # Always use aggressive grid mode
+        # Unlock Aggressive Spacing: Allow tighter gaps to harvest micro-volatility
+        # Use dynamic gap range based on initial_price to support any asset (USDT, BTC, ETH, DOGE, ...)
+        small_gap = trial.suggest_float("small_gap", min_gap, max_gap)
+        mid_mult = trial.suggest_int("mid_mult", 4, 8)  # Expanded range
+        big_mult = trial.suggest_int("big_mult", 5, 12)
+        size_pct_small = trial.suggest_float("size_pct_small", 0.01, 0.06)
+        # Unlock Aggressive Gridding: Allow aggressive grid rebuilding
+        grid_aggression_multiplier = trial.suggest_float("grid_aggression_multiplier", 1.0, 3.0)
+        # Unlock Position Bias: Allow bot to hold very little USDT if trend is down
+        bias_neutral_target = trial.suggest_float("bias_neutral_target", 0.05, 0.6)  # CRITICAL: Unlock short-bias
+        # Dynamic rebalance threshold based on asset price
+        bias_rebalance_threshold_twd = trial.suggest_float(
+            "bias_rebalance_threshold_twd", min_bias_rebalance, max_bias_rebalance
+        )
+        # Fix trend params to defaults (not used in pure_grid, save compute)
+        ema_span_fast = 200  # Default
+        ema_span_slow = 1000  # Default
+        trend_trade_equity_pct = 0.4  # Default
+    elif strategy_mode == 'pure_trend':
+        # Search trend params normally
+        ema_span_fast = trial.suggest_int("ema_span_fast_bars", 60, 300)
+        ema_span_slow = trial.suggest_int("ema_span_slow_bars", 400, 3000)
+        trend_trade_equity_pct = trial.suggest_float("trend_trade_equity_pct", 0.3, 0.5)
+        # Fix grid params to defaults (not used in pure_trend)
+        small_gap = 0.1  # Default
+        mid_mult = 3  # Default
+        big_mult = 7  # Default
+        size_pct_small = 0.05  # Default
+        grid_aggression_multiplier = 1.0  # Default
+        bias_neutral_target = 0.4  # Default
+        bias_rebalance_threshold_twd = (min_bias_rebalance + max_bias_rebalance) / 2.0
+    else:  # hybrid mode
+        # Refined search space based on latest data (sweet spot), but still dynamic by price
+        small_gap = trial.suggest_float("small_gap", min_gap, max_gap)
+        mid_mult = trial.suggest_int("mid_mult", 4, 8)  # Expanded range
+        big_mult = trial.suggest_int("big_mult", 6, 12)
+        size_pct_small = trial.suggest_float("size_pct_small", 0.01, 0.05)
+        # Re-enable EMA params for hybrid mode
+        ema_span_fast = trial.suggest_int("ema_span_fast_bars", 60, 300)
+        ema_span_slow = trial.suggest_int("ema_span_slow_bars", 400, 3000)
+        trend_trade_equity_pct = trial.suggest_float("trend_trade_equity_pct", 0.3, 0.5)  # Conservative range
+        grid_aggression_multiplier = 1.0  # Default for hybrid
+        bias_neutral_target = 0.4  # Default for hybrid
+        bias_rebalance_threshold_twd = (min_bias_rebalance + max_bias_rebalance) / 2.0
     
     # Load base config
     with open(base_config_path, 'r') as f:
@@ -42,6 +102,11 @@ def objective(trial: optuna.Trial, csv_path: Path, base_config_path: Path,
     config['size_pct_small'] = str(size_pct_small)
     config['ema_span_fast_bars'] = ema_span_fast
     config['ema_span_slow_bars'] = ema_span_slow
+    config['trend_trade_equity_pct'] = str(trend_trade_equity_pct)
+    # Dynamic / aggressive parameters
+    config['grid_aggression_multiplier'] = str(grid_aggression_multiplier)
+    config['bias_neutral_target'] = str(bias_neutral_target)
+    config['bias_rebalance_threshold_twd'] = str(bias_rebalance_threshold_twd)
     
     # Create temporary config file
     temp_config = tempfile.NamedTemporaryFile(
@@ -64,7 +129,8 @@ def objective(trial: optuna.Trial, csv_path: Path, base_config_path: Path,
             '--csv', str(csv_path),
             '--config', str(temp_config_path),
             '--init_usdt', str(init_usdt),
-            '--init_twd', str(init_twd)
+            '--init_twd', str(init_twd),
+            '--strategy-mode', strategy_mode
         ]
         
         result = subprocess.run(
@@ -98,10 +164,28 @@ def objective(trial: optuna.Trial, csv_path: Path, base_config_path: Path,
         status = result_json.get('status', 'error')
         roi_pct = result_json.get('roi_pct', 0.0)
         
+        # Extract custom metrics from JSON output
+        alpha_pct = result_json.get('alpha_pct', 0.0)
+        bh_roi_pct = result_json.get('bh_roi_pct', 0.0)
+        trades = result_json.get('trades', 0)
+        total_pnl = result_json.get('total_pnl', 0.0)
+        
+        # Set user attributes so they appear in trials_dataframe
+        trial.set_user_attr("alpha_pct", alpha_pct)
+        trial.set_user_attr("bh_roi_pct", bh_roi_pct)
+        trial.set_user_attr("trades", trades)
+        trial.set_user_attr("total_pnl", total_pnl)
+        
         # Pruning: If invalid params or error, return penalty immediately
         if status in ['invalid_params', 'error']:
             error_msg = result_json.get('error', 'Unknown error')
             print(f"Trial {trial.number}: {status} - {error_msg}")
+            return -100.0
+        
+        # CRITICAL: Pruning for low-frequency strategies
+        # We need HIGH frequency (>= 500 trades) to generate enough profit to overcome the trend
+        if trades < 500:
+            print(f"Trial {trial.number}: Low frequency (trades={trades} < 500). Pruning.")
             return -100.0
         
         # Report intermediate value for pruning
@@ -111,7 +195,7 @@ def objective(trial: optuna.Trial, csv_path: Path, base_config_path: Path,
         if trial.should_prune():
             raise optuna.TrialPruned()
         
-        print(f"Trial {trial.number}: ROI = {roi_pct:.2f}%")
+        print(f"Trial {trial.number}: ROI = {roi_pct:.2f}% | Alpha = {alpha_pct:.2f}% | Trades = {trades}")
         return roi_pct
         
     except optuna.TrialPruned:
@@ -177,6 +261,18 @@ def main():
         default="grid_optimization",
         help="Optuna study name"
     )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="Number of parallel jobs for optimization (default: 1)"
+    )
+    parser.add_argument(
+        "--strategy-mode",
+        choices=['hybrid', 'pure_grid', 'pure_trend'],
+        default='pure_grid',  # Focus on grid optimization based on isolation test results
+        help="Strategy execution mode: 'pure_grid' (default, grid only), 'hybrid', 'pure_trend' (trend only)"
+    )
     
     args = parser.parse_args()
     
@@ -188,6 +284,27 @@ def main():
     if not args.config.exists():
         print(f"Error: Config file not found: {args.config}")
         return
+
+    # ------------------------------------------------------------------
+    # Read initial price from CSV to build dynamic, asset-aware ranges
+    # ------------------------------------------------------------------
+    try:
+        # Read only the first row for efficiency
+        temp_df = pd.read_csv(args.csv, usecols=['close'], nrows=1)
+        initial_price = float(temp_df['close'].iloc[0])
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to read initial price from {args.csv}: {e}")
+        print("   Falling back to initial_price = 1.0 (dynamic ranges may be suboptimal).")
+        initial_price = 1.0
+
+    # Dynamic ranges based on asset price
+    # small_gap: 0.1% ~ 2.0% of price
+    min_gap = initial_price * 0.001
+    max_gap = initial_price * 0.02
+
+    # bias_rebalance_threshold_twd: 0.5x ~ 5x price
+    min_bias_rebalance = initial_price * 0.5
+    max_bias_rebalance = initial_price * 5.0
     
     # Create study
     study = optuna.create_study(
@@ -201,22 +318,54 @@ def main():
     print("🚀 Starting Grid Parameter Optimization")
     print(f"   CSV: {args.csv}")
     print(f"   Base Config: {args.config}")
+    print(f"   Strategy Mode: {args.strategy_mode}")
     print(f"   Trials: {args.n_trials}")
+    print(f"   Parallel Jobs: {args.n_jobs}")
+    print(f"   Detected initial_price: {initial_price:.6f}")
+    print(f"   Dynamic small_gap range: {min_gap:.6f} to {max_gap:.6f}")
+    print(f"   Dynamic bias_rebalance_threshold_twd range: {min_bias_rebalance:.2f} to {max_bias_rebalance:.2f}")
     print(f"   Search Space:")
-    print(f"     - small_gap: 0.1 to 1.5 TWD (profitable range)")
-    print(f"     - mid_mult: 2 to 5")
-    print(f"     - big_mult: 6 to 12")
-    print(f"     - size_pct_small: 0.01 to 0.05")
-    print(f"     - ema_span_fast: 60 to 300")
-    print(f"     - ema_span_slow: 400 to 3000")
+    if args.strategy_mode == 'pure_grid':
+        print(f"     - small_gap: {min_gap:.6f} to {max_gap:.6f} (0.1% - 2.0% of price)")
+        print(f"     - mid_mult: 4 to 8")
+        print(f"     - big_mult: 5 to 12")
+        print(f"     - size_pct_small: 0.01 to 0.06")
+        print(f"     - grid_aggression_multiplier: 1.0 to 3.0 (aggressive gridding)")
+        print(f"     - bias_neutral_target: 0.05 to 0.6 (unlock short-bias)")
+        print(f"     - bias_rebalance_threshold_twd: {min_bias_rebalance:.2f} to {max_bias_rebalance:.2f}")
+        print(f"     - (Trend params fixed to defaults, saving compute)")
+        print(f"     - MIN TRADES: 500 (high-frequency requirement)")
+    elif args.strategy_mode == 'pure_trend':
+        print(f"     - ema_span_fast: 60 to 300")
+        print(f"     - ema_span_slow: 400 to 3000")
+        print(f"     - trend_trade_equity_pct: 0.3 to 0.5")
+        print(f"     - (Grid params fixed to defaults)")
+    else:  # hybrid
+        print(f"     - small_gap: {min_gap:.6f} to {max_gap:.6f} (0.1% - 2.0% of price)")
+        print(f"     - mid_mult: 4 to 8")
+        print(f"     - big_mult: 6 to 12")
+        print(f"     - size_pct_small: 0.01 to 0.05")
+        print(f"     - ema_span_fast: 60 to 300")
+        print(f"     - ema_span_slow: 400 to 3000")
+        print(f"     - trend_trade_equity_pct: 0.3 to 0.5")
     print("=" * 80)
     
     # Optimize
     study.optimize(
         lambda trial: objective(
-            trial, args.csv, args.config, args.init_usdt, args.init_twd
+            trial,
+            args.csv,
+            args.config,
+            args.init_usdt,
+            args.init_twd,
+            args.strategy_mode,
+            min_gap,
+            max_gap,
+            min_bias_rebalance,
+            max_bias_rebalance,
         ),
         n_trials=args.n_trials,
+        n_jobs=args.n_jobs,
         show_progress_bar=True
     )
     
@@ -225,6 +374,15 @@ def main():
     print("✅ Optimization Complete")
     print(f"   Best Trial: {study.best_trial.number}")
     print(f"   Best ROI: {study.best_value:.2f}%")
+    
+    # Print custom metrics from best trial
+    best_alpha = study.best_trial.user_attrs.get('alpha_pct', 'N/A')
+    best_bh_roi = study.best_trial.user_attrs.get('bh_roi_pct', 'N/A')
+    best_trades = study.best_trial.user_attrs.get('trades', 'N/A')
+    print(f"   Best Alpha: {best_alpha}%")
+    print(f"   Best Buy & Hold ROI: {best_bh_roi}%")
+    print(f"   Best Trades: {best_trades}")
+    
     print("\n   Best Parameters:")
     for key, value in study.best_params.items():
         print(f"     {key}: {value}")
@@ -252,9 +410,13 @@ def main():
         # Get trials dataframe from Optuna
         df = study.trials_dataframe()
         
-        # Clean up column names (remove "params_" prefix)
-        df.columns = [col.replace('params_', '') if col.startswith('params_') else col 
-                     for col in df.columns]
+        # Clean up column names (remove "params_" and "user_attrs_" prefixes)
+        df.columns = [
+            col.replace('params_', '').replace('user_attrs_', '') 
+            if col.startswith('params_') or col.startswith('user_attrs_') 
+            else col 
+            for col in df.columns
+        ]
         
         # Ensure output directory exists
         csv_output_path = args.output_csv
