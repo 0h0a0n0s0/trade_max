@@ -141,6 +141,13 @@ class Backtester:
         self.trend_position: Dict = {}
         self.cooldown_counter = 0
         self.ema_fast_span, self.ema_slow_span = int(cfg['ema_span_fast_bars']), int(cfg['ema_span_slow_bars'])
+        # Long-term trend filter parameters (for hard stop / smart re-entry)
+        self.trend_ema_slow_span = int(cfg.get('trend_ema_slow_bars', 1440))
+        self.trend_ema_fast_span = int(cfg.get('trend_ema_fast_bars', 240))
+        self.trend_adx_threshold = float(cfg.get('trend_adx_threshold', 25))
+        # Hard stop: max drawdown from peak equity (fraction, e.g. 0.2 = 20%)
+        self.max_drawdown_stop_pct: Decimal = Decimal(str(cfg.get('max_drawdown_stop_pct', '0.20')))
+        self.peak_equity: Decimal = Decimal("0")
         self.macd_fast, self.macd_slow, self.macd_signal = int(cfg['macd_fast_period']), int(cfg['macd_slow_period']), int(cfg['macd_signal_period'])
         self.dmi_period = int(cfg['dmi_period'])
         # RSI參數（用於複合條件判斷）
@@ -180,6 +187,21 @@ class Backtester:
     def _update_equity(self, price: Decimal):
         # (此函數無變更)
         global TOTAL_EQUITY_TWD; TOTAL_EQUITY_TWD = TWD_BALANCE + USDT_BALANCE * price
+
+    def _close_all_positions(self, price: Decimal, trade_log: List[Dict], bar_index: int) -> None:
+        """
+        強制平倉所有部位（用於 Hard Stop）：
+        - 將所有 USDT 以當前價格賣出換成 TWD（扣除手續費）
+        - 清空網格掛單與趨勢部位
+        """
+        global USDT_BALANCE, TWD_BALANCE, ACTIVE_ORDERS
+        if USDT_BALANCE > 0:
+            qty = USDT_BALANCE
+            TWD_BALANCE += qty * price * (Decimal("1") - self.fee)
+            USDT_BALANCE = Decimal("0")
+            trade_log.append({'index': bar_index, 'price': price, 'type': 'hard_stop_liquidation'})
+        ACTIVE_ORDERS.clear()
+        self.trend_position = {}
 
     def _place_grid_order(self, side: str, price: Decimal, qty: Decimal):
         global ACTIVE_ORDERS
@@ -391,6 +413,9 @@ class Backtester:
         # --- [修改開始] 將指標存入 ohlc_df 以便繪圖 ---
         ema_f = ema(price_series, span=self.ema_fast_span)
         ema_s = ema(price_series, span=self.ema_slow_span)
+        # Long-term trend EMAs for hard stop / smart re-entry
+        trend_ema_fast_series = ema(price_series, span=self.trend_ema_fast_span)
+        trend_ema_slow_series = ema(price_series, span=self.trend_ema_slow_span)
         adx_series, _, _ = adx(ohlc_df['high'], ohlc_df['low'], ohlc_df['close'], period=self.dmi_period)
         
         # 計算RSI和MACD（用於複合條件判斷）
@@ -411,6 +436,8 @@ class Backtester:
         # 存入 DataFrame
         ohlc_df['ema_fast'] = ema_f
         ohlc_df['ema_slow'] = ema_s
+        ohlc_df['trend_ema_fast'] = trend_ema_fast_series
+        ohlc_df['trend_ema_slow'] = trend_ema_slow_series
         ohlc_df['adx'] = adx_series
         ohlc_df['rsi'] = rsi_series
         ohlc_df['macd'] = macd_line
@@ -425,7 +452,9 @@ class Backtester:
         # Note: initial_price already calculated in pre-flight check above
         initial_equity = TWD_BALANCE + USDT_BALANCE * initial_price
         
+        # Initialize equity and peak equity tracking
         self._update_equity(initial_price)
+        self.peak_equity = Decimal(str(TOTAL_EQUITY_TWD))
         initial_atr = Decimal(str(atr_series.iloc[0])) if atr_series is not None else None
         self._rebuild_grid(initial_price, trend='neutral', current_adx=adx_series.iloc[0], current_atr=initial_atr)
         if diagnostic_stats is not None:
@@ -436,21 +465,67 @@ class Backtester:
             price = Decimal(str(price_val))
             self._update_equity(price)
             equity_history.append(float(TOTAL_EQUITY_TWD))  # Track equity for drawdown
-            if self.cooldown_counter > 0: self.cooldown_counter -= 1
+
+            # --- Trailing Hard Stop (Safety Airbag) ---
+            current_equity = Decimal(str(TOTAL_EQUITY_TWD))
+            if self.peak_equity <= 0:
+                self.peak_equity = current_equity
+            else:
+                self.peak_equity = max(self.peak_equity, current_equity)
+            current_drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else Decimal("0")
+            if current_drawdown >= self.max_drawdown_stop_pct:
+                if self.verbose:
+                    LOG.critical(
+                        f"HARD STOP TRIGGERED! Drawdown: {float(current_drawdown) * 100:.2f}%. Stopping Strategy."
+                    )
+                # Close all positions and stop trading
+                self._close_all_positions(price, trade_log, bar_index=i)
+                self.strategy_state = 'STOPPED'
+                break
+
+            if self.cooldown_counter > 0:
+                self.cooldown_counter -= 1
             
             current_adx = adx_series.iloc[i]
             current_atr = Decimal(str(atr_series.iloc[i])) if atr_series is not None else None
+            trend_ema_fast_val = float(trend_ema_fast_series.iloc[i])
+            trend_ema_slow_val = float(trend_ema_slow_series.iloc[i])
+            price_float = float(price)
             
             # 診斷數據：價格範圍
             if diagnostic_stats is not None:
-                price_float = float(price)
                 diagnostic_stats['price_min'] = min(diagnostic_stats['price_min'], price_float)
                 diagnostic_stats['price_max'] = max(diagnostic_stats['price_max'], price_float)
             
+            # --- Trend Filter with Soft Restart ---
+            # STOP Buying: Bear market detected (price below slow trend EMA)
+            if self.strategy_state in ('GRID', 'TREND_FOLLOWING') and price_float < trend_ema_slow_val:
+                if self.strategy_state != 'PAUSED':
+                    self.strategy_state = 'PAUSED'
+                    if self.verbose:
+                        LOG.warning(
+                            f"Trend Filter: Price {price_float:.3f} < Slow EMA {trend_ema_slow_val:.3f}. "
+                            f"Pausing new BUY orders (state=PAUSED)."
+                        )
+            # RESTART Buying: Trend recovery (price above fast trend EMA and strong ADX)
+            elif self.strategy_state == 'PAUSED':
+                if price_float > trend_ema_fast_val and float(current_adx) >= self.trend_adx_threshold:
+                    self.strategy_state = 'GRID'
+                    if self.verbose:
+                        LOG.info(
+                            f"Trend Filter: Recovery detected. Price {price_float:.3f} > Fast EMA {trend_ema_fast_val:.3f}, "
+                            f"ADX {current_adx:.2f} >= {self.trend_adx_threshold}. Restarting GRID and rebuilding."
+                        )
+                    self._rebuild_grid(price, trend='neutral', current_adx=current_adx, current_atr=current_atr)
+                    if diagnostic_stats is not None:
+                        diagnostic_stats['grid_rebuilds'] += 1
+                        diagnostic_stats['grid_orders_placed'] += len(ACTIVE_ORDERS)
+            
             # --- Strategy Mode Logic ---
-            # Force strategy state based on mode
+            # Force strategy state based on mode (do not override PAUSED/STOPPED)
             if self.strategy_mode == 'pure_grid':
-                self.strategy_state = 'GRID'  # Force GRID mode, disable trend entry
+                if self.strategy_state not in ('PAUSED', 'STOPPED'):
+                    self.strategy_state = 'GRID'  # Force GRID mode, disable trend entry
             elif self.strategy_mode == 'pure_trend':
                 # In pure_trend mode, skip all grid operations
                 # Only execute trend entry/exit logic

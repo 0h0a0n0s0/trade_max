@@ -44,6 +44,10 @@ def objective(
     Returns ROI percentage (to be maximized).
     """
     # Define search space (CRITICAL: Aggressive profitability optimization)
+    # New trend / risk parameters shared across modes
+    trend_ema_slow_bars = trial.suggest_int("trend_ema_slow_bars", 720, 2880, step=60)   # 12h ~ 48h
+    trend_ema_fast_bars = trial.suggest_int("trend_ema_fast_bars", 60, 480, step=30)    # 1h ~ 8h
+    max_drawdown_stop_pct = trial.suggest_float("max_drawdown_stop_pct", 0.15, 0.35)    # 15% ~ 35%
     # Force pure_grid mode for high-frequency trading
     if strategy_mode == 'pure_grid' or True:  # Always use aggressive grid mode
         # Unlock Aggressive Spacing: Allow tighter gaps to harvest micro-volatility
@@ -103,6 +107,10 @@ def objective(
     config['ema_span_fast_bars'] = ema_span_fast
     config['ema_span_slow_bars'] = ema_span_slow
     config['trend_trade_equity_pct'] = str(trend_trade_equity_pct)
+    # New trend / risk parameters
+    config['trend_ema_slow_bars'] = int(trend_ema_slow_bars)
+    config['trend_ema_fast_bars'] = int(trend_ema_fast_bars)
+    config['max_drawdown_stop_pct'] = float(max_drawdown_stop_pct)
     # Dynamic / aggressive parameters
     config['grid_aggression_multiplier'] = str(grid_aggression_multiplier)
     config['bias_neutral_target'] = str(bias_neutral_target)

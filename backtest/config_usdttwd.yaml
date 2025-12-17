@@ -53,6 +53,12 @@ min_order_value_twd: "300.0"  # 單筆掛單的最小TWD價值 (交易所限制�
 # risk_controller_config_path: "config_usdttwd.yaml" # risk_controller.py 已有預設邏輯尋找此檔案
 min_twd_balance_threshold: "16600.0" # 原為 5000，改為總TWD的 25% 左右，保留購買力
 
+# Hard Stop & Trend Filter Parameters
+max_drawdown_stop_pct: "0.20"   # 20% Hard Stop from peak equity
+trend_ema_slow_bars: 1440       # Daily EMA (24h * 60m)
+trend_ema_fast_bars: 240        # 4h EMA
+trend_adx_threshold: 25         # Strong trend ADX threshold
+
 
 # --- Black Swan Protection (沿用 strategy_usdttwd_grid.py 中的骨架) ---
 use_black_swan_protection: true   # 強烈建議在實盤中永遠開啟
