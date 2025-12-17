@@ -52,14 +52,16 @@ def objective(
     if strategy_mode == 'pure_grid' or True:  # Always use aggressive grid mode
         # Unlock Aggressive Spacing: Allow tighter gaps to harvest micro-volatility
         # Use dynamic gap range based on initial_price to support any asset (USDT, BTC, ETH, DOGE, ...)
-        small_gap = trial.suggest_float("small_gap", min_gap, max_gap)
+        # Constrain to 0.1% ~ 0.5% of price: min_gap 已為 0.1%，上限改為 0.5%
+        capped_max_gap = min(max_gap, min_gap * 5.0)
+        small_gap = trial.suggest_float("small_gap", min_gap, capped_max_gap)
         mid_mult = trial.suggest_int("mid_mult", 4, 8)  # Expanded range
         big_mult = trial.suggest_int("big_mult", 5, 12)
         size_pct_small = trial.suggest_float("size_pct_small", 0.01, 0.06)
         # Unlock Aggressive Gridding: Allow aggressive grid rebuilding
         grid_aggression_multiplier = trial.suggest_float("grid_aggression_multiplier", 1.0, 3.0)
-        # Unlock Position Bias: Allow bot to hold very little USDT if trend is down
-        bias_neutral_target = trial.suggest_float("bias_neutral_target", 0.05, 0.6)  # CRITICAL: Unlock short-bias
+        # Unlock Position Bias: Force bot to be cash-heavy even in neutral zones
+        bias_neutral_target = trial.suggest_float("bias_neutral_target", 0.0, 0.3)
         # Dynamic rebalance threshold based on asset price
         bias_rebalance_threshold_twd = trial.suggest_float(
             "bias_rebalance_threshold_twd", min_bias_rebalance, max_bias_rebalance

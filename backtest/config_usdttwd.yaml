@@ -10,7 +10,7 @@ qty_precision: "0.001"        # 訂單數量精度 (例如 USDT 為小數點後3
 
 # --- Core Grid Strategy Parameters (同步 backtester_grid.py 邏輯) ---
 # Grid Structure
-small_gap: "0.05"            # 最小網格間距 (TWD)
+small_gap: "3000.0"          # 最小網格間距 (TWD)；BTC 價格約 3,000,000 時約為 0.1%
 mid_mult: 3                   # small_gap 的倍數，用於得到 mid_gap (mid_gap = small_gap * mid_mult)
 big_mult: 7                   # small_gap 的倍數，用於得到 big_gap (big_gap = small_gap * big_mult)
 levels_each: 12                # 每個網格層級在中心價上下各有多少層掛單
@@ -21,13 +21,13 @@ size_pct_mid: "0.03"          # 中間距網格層的訂單
 size_pct_big: "0.02"          # 大間距網格層的訂單
 
 # Grid Recenter
-recenter_interval_minutes: 660 # 網格重新置中的間隔時間 (分鐘)。(backtester 使用 8000 根1分鐘bar)
+recenter_interval_minutes: 360 # 網格重新置中的間隔時間 (分鐘)。更頻繁地重置網格以捕捉趨勢
 
 # --- Trend Following / Directional Bias Parameters (同步 backtester_grid.py 邏輯) ---
 ema_span_fast_bars: 20    # 快速EMA週期 (分鐘) (1分鐘K線下為10小時)
 ema_span_slow_bars: 250   # 慢速EMA週期 (分鐘) (1分鐘K線下為50小時)
 bias_high: "0.60"             # 看漲時的目標USDT曝險比例 (USDT價值 / 總權益)
-bias_low: "0.25"              # 看跌時的目標USDT曝險比例
+bias_low: "0.05"              # 看跌時的目標USDT曝險比例（僅保留約 5% USDT，現金為王）
 bias_neutral_target: "0.40"   # EMA快線 == EMA慢線 (趨勢中性) 時的目標USDT曝險比例
 bias_rebalance_threshold_twd: "1660.0" # 當前曝險與目標曝險差異超過此TWD等值時，進行再平衡
                                       # (backtester 使用: price * Decimal("30"))

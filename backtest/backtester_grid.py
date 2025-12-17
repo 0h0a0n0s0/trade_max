@@ -188,6 +188,91 @@ class Backtester:
         # (此函數無變更)
         global TOTAL_EQUITY_TWD; TOTAL_EQUITY_TWD = TWD_BALANCE + USDT_BALANCE * price
 
+    def _rebalance_to_target(
+        self,
+        price: Decimal,
+        target_usdt_pct: Decimal,
+        trade_log: List[Dict],
+        bar_index: int,
+    ) -> None:
+        """
+        將當前 USDT/TWD 部位再平衡至目標 USDT 權益比例（target_usdt_pct）。
+        - target_usdt_pct: 0.0 ~ 1.0，USDT 市值 / 總權益
+        - 在 BEAR_DEFENSE 中通常會設為非常低（例如 0.05），實現「現金為王」。
+        """
+        global USDT_BALANCE, TWD_BALANCE, TOTAL_EQUITY_TWD
+        total_equity = TWD_BALANCE + USDT_BALANCE * price
+        if total_equity <= 0:
+            return
+
+        target_usdt_pct = max(Decimal("0"), min(Decimal("1"), target_usdt_pct))
+        current_usdt_val = USDT_BALANCE * price
+        current_usdt_pct = current_usdt_val / total_equity
+
+        diff_pct = current_usdt_pct - target_usdt_pct
+        tolerance = Decimal("0.01")  # 1% 容忍度，避免頻繁小額調整
+        if abs(diff_pct) < tolerance:
+            return
+
+        # 目前 USDT 比例過高 -> 賣出 USDT 換成 TWD
+        if diff_pct > 0:
+            target_usdt_val = total_equity * target_usdt_pct
+            excess_val = current_usdt_val - target_usdt_val
+            qty_to_sell = excess_val / price
+            qty_to_sell = quantize(qty_to_sell, self.cfg["qty_precision"])
+            if qty_to_sell <= 0:
+                return
+            qty_to_sell = min(qty_to_sell, USDT_BALANCE)
+            if qty_to_sell <= 0:
+                return
+
+            USDT_BALANCE -= qty_to_sell
+            TWD_BALANCE += qty_to_sell * price * (Decimal("1") - self.fee)
+            self._update_equity(price)
+            trade_log.append(
+                {
+                    "index": bar_index,
+                    "price": price,
+                    "type": "bear_defense_rebalance_sell",
+                    "qty": float(qty_to_sell),
+                }
+            )
+            if self.verbose:
+                LOG.info(
+                    f"BEAR_DEFENSE Rebalance SELL: qty={qty_to_sell} @ {price:.3f}, "
+                    f"target_usdt_pct={float(target_usdt_pct):.3f}"
+                )
+        else:
+            # 目前 USDT 比例過低 -> 買入 USDT（一般不會在 BEAR_DEFENSE 中使用，但保留邏輯完整性）
+            target_usdt_val = total_equity * target_usdt_pct
+            deficit_val = target_usdt_val - current_usdt_val
+            cost_twd = deficit_val * (Decimal("1") + self.fee)
+            if cost_twd <= 0 or cost_twd > TWD_BALANCE:
+                return
+
+            qty_to_buy = quantize(
+                cost_twd / (price * (Decimal("1") + self.fee)), self.cfg["qty_precision"]
+            )
+            if qty_to_buy <= 0:
+                return
+
+            TWD_BALANCE -= qty_to_buy * price * (Decimal("1") + self.fee)
+            USDT_BALANCE += qty_to_buy
+            self._update_equity(price)
+            trade_log.append(
+                {
+                    "index": bar_index,
+                    "price": price,
+                    "type": "bear_defense_rebalance_buy",
+                    "qty": float(qty_to_buy),
+                }
+            )
+            if self.verbose:
+                LOG.info(
+                    f"BEAR_DEFENSE Rebalance BUY: qty={qty_to_buy} @ {price:.3f}, "
+                    f"target_usdt_pct={float(target_usdt_pct):.3f}"
+                )
+
     def _close_all_positions(self, price: Decimal, trade_log: List[Dict], bar_index: int) -> None:
         """
         強制平倉所有部位（用於 Hard Stop）：
@@ -497,24 +582,33 @@ class Backtester:
                 diagnostic_stats['price_min'] = min(diagnostic_stats['price_min'], price_float)
                 diagnostic_stats['price_max'] = max(diagnostic_stats['price_max'], price_float)
             
-            # --- Trend Filter with Soft Restart ---
-            # STOP Buying: Bear market detected (price below slow trend EMA)
+            # --- Trend Filter with Active Bear Defense ---
+            # Enter BEAR_DEFENSE: Bear market detected (price below slow trend EMA)
             if self.strategy_state in ('GRID', 'TREND_FOLLOWING') and price_float < trend_ema_slow_val:
-                if self.strategy_state != 'PAUSED':
-                    self.strategy_state = 'PAUSED'
+                if self.strategy_state != 'BEAR_DEFENSE':
                     if self.verbose:
                         LOG.warning(
-                            f"Trend Filter: Price {price_float:.3f} < Slow EMA {trend_ema_slow_val:.3f}. "
-                            f"Pausing new BUY orders (state=PAUSED)."
+                            f"🐻 Trend Bearish: Price {price_float:.3f} < Slow EMA {trend_ema_slow_val:.3f}. "
+                            f"Switching to BEAR_DEFENSE and rebalancing to bias_low."
                         )
-            # RESTART Buying: Trend recovery (price above fast trend EMA and strong ADX)
-            elif self.strategy_state == 'PAUSED':
+                    self.strategy_state = 'BEAR_DEFENSE'
+                    # CRITICAL: Force rebalance to bias_low immediately
+                    try:
+                        target_usdt_pct = Decimal(str(self.cfg.get('bias_low', '0.05')))
+                    except Exception:
+                        target_usdt_pct = Decimal("0.05")
+                    self._rebalance_to_target(price, target_usdt_pct, trade_log, bar_index=i)
+                    # Cancel all existing grid orders
+                    ACTIVE_ORDERS.clear()
+            # RESTART from BEAR_DEFENSE: Trend recovery (price above fast trend EMA and strong ADX)
+            elif self.strategy_state == 'BEAR_DEFENSE':
                 if price_float > trend_ema_fast_val and float(current_adx) >= self.trend_adx_threshold:
                     self.strategy_state = 'GRID'
                     if self.verbose:
                         LOG.info(
-                            f"Trend Filter: Recovery detected. Price {price_float:.3f} > Fast EMA {trend_ema_fast_val:.3f}, "
-                            f"ADX {current_adx:.2f} >= {self.trend_adx_threshold}. Restarting GRID and rebuilding."
+                            f"Trend Recovery: Price {price_float:.3f} > Fast EMA {trend_ema_fast_val:.3f}, "
+                            f"ADX {current_adx:.2f} >= {self.trend_adx_threshold}. "
+                            f"Leaving BEAR_DEFENSE, restarting GRID and rebuilding."
                         )
                     self._rebuild_grid(price, trend='neutral', current_adx=current_adx, current_atr=current_atr)
                     if diagnostic_stats is not None:
@@ -522,9 +616,9 @@ class Backtester:
                         diagnostic_stats['grid_orders_placed'] += len(ACTIVE_ORDERS)
             
             # --- Strategy Mode Logic ---
-            # Force strategy state based on mode (do not override PAUSED/STOPPED)
+            # Force strategy state based on mode (do not override BEAR_DEFENSE/STOPPED)
             if self.strategy_mode == 'pure_grid':
-                if self.strategy_state not in ('PAUSED', 'STOPPED'):
+                if self.strategy_state not in ('BEAR_DEFENSE', 'STOPPED'):
                     self.strategy_state = 'GRID'  # Force GRID mode, disable trend entry
             elif self.strategy_mode == 'pure_trend':
                 # In pure_trend mode, skip all grid operations
