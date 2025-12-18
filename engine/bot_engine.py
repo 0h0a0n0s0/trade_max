@@ -638,6 +638,37 @@ class BotEngine:
                         )
 
     # ------------------------------------------------------------------ #
+    # [Added] Periodic Reporting
+    # ------------------------------------------------------------------ #
+    async def _send_periodic_report(self) -> None:
+        """Send periodic performance report (Scheduled at 0, 8, 18 hours)."""
+        try:
+            # 1. Ensure balances are up-to-date
+            await self.update_balances()
+            
+            # 2. Calculate key metrics
+            total_equity = self.total_equity_twd
+            usdt_price = await self._get_current_price() or Decimal("0")
+            
+            msg = (
+                f"📊 **Periodic Asset Report**\n\n"
+                f"🕒 Time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC`\n"
+                f"💰 **Total Equity (TWD)**: `{total_equity:,.0f}`\n"
+                f"--------------------------------\n"
+                f"💵 USDT Balance: `{self.usdt_balance:,.2f}`\n"
+                f"💵 TWD Balance: `{self.twd_balance:,.0f}`\n"
+                f"📈 Current Price: `{usdt_price:,.2f}`\n"
+                f"--------------------------------\n"
+                f"⚠️ *System Operational*"
+            )
+            
+            # Send via alerter
+            await alerter.send_status_update(msg)
+            
+        except Exception as e:
+            log.error("Error sending periodic report: %s", e)
+
+    # ------------------------------------------------------------------ #
     # 混合策略 / 方向性偏置 / 黑天鵝檢查
     # （保留原始邏輯，略）
     # ------------------------------------------------------------------ #
