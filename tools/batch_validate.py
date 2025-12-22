@@ -6,9 +6,9 @@ import sys
 import time
 
 # ================= 設定區 =================
-RESULTS_CSV = 'backtest/optimization_results_btc_safe3_2024_OnlyHardStop.csv'  # 您的 2024 訓練結果
+RESULTS_CSV = 'backtest/optimization_results.csv'  # 您的 2024 訓練結果
 BASE_CONFIG = 'backtest/config_usdttwd.yaml'                    # 您的基礎設定檔
-TEST_CSV_2025 = 'backtest/btctwd_1m_2025.csv'                   # 要驗證的 2025 數據
+TEST_CSV_2025 = 'data/btctwd_1m_2025.csv'                   # 要驗證的 2025 數據
 OUTPUT_DIR = 'backtest/candidates'                              # 存放候選參數的資料夾
 TOP_N = 200                                                     # 要取前幾名來驗證
 # ============================================
@@ -80,7 +80,7 @@ def main():
             sys.executable, "core/backtester.py",
             "--csv", TEST_CSV_2025,
             "--config", candidate_config_file,
-            "--init_usdt", "10000",   # 改成底線 _
+            "--init_usdt", "0.2",   # 改成底線 _
             "--init_twd", "300000"    # 改成底線 _
         ]
         

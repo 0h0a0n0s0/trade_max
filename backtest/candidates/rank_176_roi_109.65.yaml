@@ -1,7 +1,7 @@
 adx_period: 14
 adx_strength_threshold: 25
 adx_threshold: 35
-asset_pair: btctwd
+asset_pair: usdttwd
 atr_period: 14
 atr_spacing_multiplier: '0.8'
 bias_high: '0.60'
@@ -38,14 +38,14 @@ size_pct_small: 0.0120940271131302
 small_gap: 21748.34626445304
 stagnation_alert_hours: 12
 strategy_loop_interval_sec: 10
-taker_fee: '0.0002'
+taker_fee: '0.0004'
 trend_cooldown_bars: 240
 trend_ema_fast_bars: 420
 trend_ema_slow_bars: 7200
 trend_trade_equity_pct: '0.4'
 trend_trailing_stop_pct: '0.02'
 twd_unit: TWD
-usdt_unit: BTC
+usdt_unit: USDT
 use_adx_filter: true
 use_atr_spacing: true
 use_black_swan_protection: true
