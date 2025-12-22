@@ -16,7 +16,8 @@ import sys
 # 添加父目錄到路徑
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from strategy_usdttwd_grid_refactored import GridStrategy, BotEngine
+from strategy.grid_strategy import GridStrategy
+from engine.bot_engine import BotEngine
 
 
 async def example_basic_usage():
@@ -26,7 +27,7 @@ async def example_basic_usage():
     print("=" * 80)
     
     # 1. 載入配置
-    config_path = Path(__file__).parent.parent / "config_usdttwd.yaml"
+    config_path = Path(__file__).parent.parent / "configs" / "config_rank77.yaml"
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     

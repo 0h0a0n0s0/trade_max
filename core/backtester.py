@@ -855,7 +855,7 @@ def main():
     )
     parser.add_argument(
         "--config",
-        default="config_usdttwd.yaml",
+        default="backtest/config_usdttwd.yaml",
         type=Path,
         help="Path to the strategy config YAML file.",
     )
