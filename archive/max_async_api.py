@@ -16,6 +16,17 @@ from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 import logging
 
+# 載入 .env 檔案（從項目根目錄）
+project_root = Path(__file__).parent.parent
+env_path = project_root / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+else:
+    # 如果根目錄沒有，也嘗試從當前目錄載入（向後兼容）
+    local_env_path = Path(__file__).parent / ".env"
+    if local_env_path.exists():
+        load_dotenv(dotenv_path=local_env_path)
+
 logger = logging.getLogger("max_async_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s")
 log = logging.getLogger("三層固定間隙網格")  # Use the module name as the logger name

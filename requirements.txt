@@ -8,3 +8,4 @@ optuna
 matplotlib
 numpy
 schedule  # 用於工作流程管理器定時任務
+greenlet

@@ -12,13 +12,22 @@ import signal
 import time
 import uuid
 from decimal import Decimal, getcontext
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 from typing import Dict, Optional, Any, Callable
+import json
 
 import functools
 import yaml
 from sqlalchemy import func
+
+import sys
+from pathlib import Path
+
+# 添加 archive 目錄到 sys.path，以便導入遺留模組
+archive_path = Path(__file__).parent.parent / "archive"
+if str(archive_path) not in sys.path:
+    sys.path.insert(0, str(archive_path))
 
 from max_async_api import max_api
 from risk_controller import RiskController
@@ -68,11 +77,17 @@ class BotEngine:
         self.is_halted: bool = False
         self.main_loop_task: Optional[asyncio.Task] = None
 
-        # 餘額和權益
-        self.usdt_balance: Decimal = Decimal("0")
-        self.twd_balance: Decimal = Decimal("0")
-        self.available_usdt_balance: Decimal = Decimal("0")
-        self.available_twd_balance: Decimal = Decimal("0")
+        # 貨幣符號（從配置中提取）
+        self.base_coin: str = self.strategy.params.get("usdt_unit", "USDT").lower()
+        self.quote_coin: str = self.strategy.params.get("twd_unit", "TWD").lower()
+        self.base_unit: str = self.strategy.params.get("usdt_unit", "USDT")
+        self.quote_unit: str = self.strategy.params.get("twd_unit", "TWD")
+
+        # 餘額和權益（動態貨幣支持）
+        self.base_balance: Decimal = Decimal("0")
+        self.quote_balance: Decimal = Decimal("0")
+        self.available_base_balance: Decimal = Decimal("0")
+        self.available_quote_balance: Decimal = Decimal("0")
         self.total_equity_twd: Decimal = Decimal("0")
         self.last_balance_update_ts: Optional[datetime] = None
 
@@ -286,7 +301,7 @@ class BotEngine:
         return None
 
     async def update_balances(self) -> None:
-        """更新餘額"""
+        """更新餘額（支持動態貨幣對）"""
         try:
             current_price = await self._get_current_price()
             if not current_price:
@@ -295,21 +310,37 @@ class BotEngine:
                 else:
                     return
 
-            usdt_data = await max_api.get_v2_balance("usdt")
-            twd_data = await max_api.get_v2_balance("twd")
+            base_data = await max_api.get_v2_balance(self.base_coin)
+            quote_data = await max_api.get_v2_balance(self.quote_coin)
+            
+            if not base_data:
+                log.warning("Failed to fetch %s balance from API", self.base_coin)
+                return
+            if not quote_data:
+                log.warning("Failed to fetch %s balance from API", self.quote_coin)
+                return
 
-            if usdt_data and twd_data:
-                self.usdt_balance = Decimal(str(usdt_data.get("balance", "0"))) + Decimal(
-                    str(usdt_data.get("locked", "0"))
+            if base_data and quote_data:
+                self.base_balance = Decimal(str(base_data.get("balance", "0"))) + Decimal(
+                    str(base_data.get("locked", "0"))
                 )
-                self.twd_balance = Decimal(str(twd_data.get("balance", "0"))) + Decimal(
-                    str(twd_data.get("locked", "0"))
+                self.quote_balance = Decimal(str(quote_data.get("balance", "0"))) + Decimal(
+                    str(quote_data.get("locked", "0"))
                 )
-                self.available_usdt_balance = Decimal(str(usdt_data.get("balance", "0")))
-                self.available_twd_balance = Decimal(str(twd_data.get("balance", "0")))
+                self.available_base_balance = Decimal(str(base_data.get("balance", "0")))
+                self.available_quote_balance = Decimal(str(quote_data.get("balance", "0")))
 
-                self.total_equity_twd = self.twd_balance + self.usdt_balance * current_price
+                self.total_equity_twd = self.quote_balance + self.base_balance * current_price
                 self.last_balance_update_ts = datetime.now(timezone.utc)
+                
+                log.debug(
+                    "Balance updated: %s=%s, %s=%s, total_equity_twd=%s",
+                    self.base_coin.upper(),
+                    self.base_balance,
+                    self.quote_coin.upper(),
+                    self.quote_balance,
+                    self.total_equity_twd,
+                )
 
         except Exception as e:  # pragma: no cover
             log.error("Error updating balances: %s", e, exc_info=True)
@@ -325,12 +356,24 @@ class BotEngine:
         """
         log.info("Attempting to rebuild grid around new center price: %s", center_price)
 
-        # 預檢
+        # 預檢：確保餘額已更新
+        await self.update_balances()
+        
+        # 詳細日誌
+        log.info(
+            "Balance check: base_balance=%s, quote_balance=%s, total_equity_twd=%s",
+            self.base_balance,
+            self.quote_balance,
+            self.total_equity_twd,
+        )
+        
         if self.total_equity_twd <= 0:
-            await self.update_balances()
-            if self.total_equity_twd <= 0:
-                log.error("Equity unavailable or zero. Aborting grid rebuild.")
-                return
+            log.error(
+                "Equity unavailable or zero. base_balance=%s, quote_balance=%s. Aborting grid rebuild.",
+                self.base_balance,
+                self.quote_balance,
+            )
+            return
 
         price_for_calc = await self._get_current_price() or center_price
         if price_for_calc <= 0:
@@ -363,24 +406,71 @@ class BotEngine:
 
         # 檢查最小訂單價值
         min_size_pct = min(layer.size_pct for layer in self.strategy.grid_layers)
-        min_qty_usdt = self.strategy.quantize_qty(min_size_pct * self.total_equity_twd / price_for_calc)
+        raw_min_qty = min_size_pct * self.total_equity_twd / price_for_calc
+        
+        # 對於 BTC 等高價資產，qty 可能很小，需要更精細的精度處理
+        # 如果量化後為 0，但原始值 > 0，使用原始值（後續會在實際下單時再量化）
+        min_qty_base = self.strategy.quantize_qty(raw_min_qty)
+        if min_qty_base <= 0 and raw_min_qty > 0:
+            # 使用更精細的精度重新量化（降低精度要求）
+            from decimal import ROUND_UP
+            # 嘗試使用更小的精度單位
+            finer_precision = Decimal("0.00001")  # 0.00001 BTC
+            min_qty_base = raw_min_qty.quantize(finer_precision, rounding=ROUND_UP)
+            log.info(
+                "min_qty was 0 after quantization, using finer precision: raw=%s, quantized=%s",
+                raw_min_qty,
+                min_qty_base,
+            )
 
+        # 計算最遠買價（確保不為負數）
         farthest_buy_price = center_price
         for layer in self.strategy.grid_layers:
             price = center_price - (layer.gap_abs * layer.levels_each_side)
-            if price < farthest_buy_price:
+            if price > 0 and price < farthest_buy_price:  # 只考慮正數價格
                 farthest_buy_price = price
+        
+        # 如果所有計算結果都是負數，使用一個保守的默認值（中心價的 50%）
+        if farthest_buy_price <= 0:
+            farthest_buy_price = center_price * Decimal("0.5")
+            log.warning(
+                "All calculated buy prices were negative or zero. Using conservative default: %s (50%% of center price)",
+                farthest_buy_price,
+            )
+        
         farthest_buy_price = self.strategy.quantize_price(farthest_buy_price)
 
         min_order_value_twd = Decimal(self.strategy.params.get("min_order_value_twd", "300.0"))
-        smallest_order_value = min_qty_usdt * farthest_buy_price
+        
+        # 使用中心價計算最小訂單價值（更合理，因為大部分訂單在中心價附近）
+        # 而不是使用最遠買價（可能非常低，導致價值被低估）
+        price_for_order_value = center_price
+        
+        # 但如果最遠買價 > 中心價的 80%，使用最遠買價（更保守）
+        if farthest_buy_price > center_price * Decimal("0.8"):
+            price_for_order_value = farthest_buy_price
+        
+        smallest_order_value = min_qty_base * price_for_order_value
 
-        if smallest_order_value < min_order_value_twd:
+        log.info(
+            "Order value check: min_size_pct=%s, min_qty_base=%s, farthest_buy_price=%s, price_for_calc=%s, smallest_order_value=%s, threshold=%s",
+            min_size_pct,
+            min_qty_base,
+            farthest_buy_price,
+            price_for_order_value,
+            smallest_order_value,
+            min_order_value_twd,
+        )
+
+        if smallest_order_value < min_order_value_twd or min_qty_base <= 0:
             log.warning(
                 "Grid rebuild ABORTED. Calculated smallest order value "
-                "(%.2f TWD) is below threshold (%.2f TWD).",
+                "(%.2f TWD) is below threshold (%.2f TWD). "
+                "min_qty_base=%s, total_equity_twd=%s",
                 float(smallest_order_value),
                 float(min_order_value_twd),
+                min_qty_base,
+                self.total_equity_twd,
             )
             self.strategy.last_recenter_ts = datetime.now(timezone.utc)
             return
@@ -392,8 +482,32 @@ class BotEngine:
 
         tasks = []
         for layer in self.strategy.grid_layers:
-            qty_usdt = self.strategy.quantize_qty(layer.size_pct * self.total_equity_twd / price_for_calc)
-            if qty_usdt <= 0:
+            # 計算原始數量
+            raw_qty = layer.size_pct * self.total_equity_twd / price_for_calc
+            
+            # 量化數量（使用與預檢相同的邏輯）
+            qty_base = self.strategy.quantize_qty(raw_qty)
+            
+            # 如果量化後為 0 但原始值 > 0，使用更精細的精度
+            if qty_base <= 0 and raw_qty > 0:
+                from decimal import ROUND_UP
+                finer_precision = Decimal("0.00001")  # 0.00001 BTC
+                qty_base = raw_qty.quantize(finer_precision, rounding=ROUND_UP)
+                log.debug(
+                    "Layer %d qty was 0 after quantization, using finer precision: raw=%s, quantized=%s",
+                    layer.idx,
+                    raw_qty,
+                    qty_base,
+                )
+            
+            if qty_base <= 0:
+                log.warning(
+                    "Layer %d skipped: qty_base=%s (raw=%s, size_pct=%s)",
+                    layer.idx,
+                    qty_base,
+                    raw_qty,
+                    layer.size_pct,
+                )
                 continue
 
             gap_to_use = dynamic_gaps.get(layer.idx, layer.gap_abs)
@@ -409,12 +523,12 @@ class BotEngine:
             for i in range(1, buy_levels + 1):
                 buy_price = self.strategy.quantize_price(center_price - (gap_to_use * i))
                 if buy_price > 0:
-                    tasks.append(self._place_grid_order("buy", buy_price, qty_usdt, layer.idx))
+                    tasks.append(self._place_grid_order("buy", buy_price, qty_base, layer.idx))
 
             for i in range(1, sell_levels + 1):
                 sell_price = self.strategy.quantize_price(center_price + (gap_to_use * i))
                 if sell_price > 0:
-                    tasks.append(self._place_grid_order("sell", sell_price, qty_usdt, layer.idx))
+                    tasks.append(self._place_grid_order("sell", sell_price, qty_base, layer.idx))
 
         await asyncio.gather(*tasks)
         log.info("Grid rebuild process completed. Attempted to place %d orders.", len(tasks))
@@ -441,6 +555,17 @@ class BotEngine:
         price_q = self.strategy.quantize_price(price)
         qty_q = self.strategy.quantize_qty(qty)
 
+        # 如果量化後為 0 但原始值 > 0，使用更精細的精度
+        if qty_q <= 0 and qty > 0:
+            from decimal import ROUND_UP
+            finer_precision = Decimal("0.00001")  # 0.00001 BTC
+            qty_q = qty.quantize(finer_precision, rounding=ROUND_UP)
+            log.debug(
+                "qty was 0 after quantization, using finer precision: raw=%s, quantized=%s",
+                qty,
+                qty_q,
+            )
+
         min_order_value = Decimal(self.strategy.params.get("min_order_value_twd", "300.0"))
         if qty_q <= 0 or price_q <= 0 or (price_q * qty_q) < min_order_value:
             log.warning(
@@ -450,14 +575,51 @@ class BotEngine:
             )
             return None
 
+        # 餘額檢查：賣單前檢查 BTC 餘額，買單前檢查 TWD 餘額
+        if side == "sell":
+            # 確保餘額已更新
+            if self.last_balance_update_ts is None or (
+                datetime.now(timezone.utc) - self.last_balance_update_ts
+            ).total_seconds() > 5:
+                await self.update_balances()
+
+            if self.available_base_balance < qty_q:
+                log.warning(
+                    "Order %s skipped. Insufficient %s balance: available=%s, required=%s",
+                    client_oid,
+                    self.base_unit,
+                    self.available_base_balance,
+                    qty_q,
+                )
+                return None
+
+        if side == "buy":
+            # 檢查 TWD 餘額
+            required_twd = price_q * qty_q
+            # 確保餘額已更新
+            if self.last_balance_update_ts is None or (
+                datetime.now(timezone.utc) - self.last_balance_update_ts
+            ).total_seconds() > 5:
+                await self.update_balances()
+
+            if self.available_quote_balance < required_twd:
+                log.warning(
+                    "Order %s skipped. Insufficient %s balance: available=%s, required=%s",
+                    client_oid,
+                    self.quote_unit,
+                    self.available_quote_balance,
+                    required_twd,
+                )
+                return None
+
         log.info(
             "Attempting place: %s - %s %s %s @ %s %s",
             client_oid,
             side.upper(),
             qty_q,
-            self.strategy.params.get("usdt_unit", "USDT"),
+            self.base_unit,
             price_q,
-            self.strategy.params.get("twd_unit", "TWD"),
+            self.quote_unit,
         )
         try:
             # 可選：post-only 調整
@@ -614,11 +776,11 @@ class BotEngine:
                             avg_fill_price + layer.gap_abs if new_side == "sell" else avg_fill_price - layer.gap_abs
                         )
                         price_for_calc = await self._get_current_price() or new_price
-                        new_qty = self.strategy.quantize_qty(
+                        new_qty_base = self.strategy.quantize_qty(
                             (layer.size_pct * self.total_equity_twd) / price_for_calc
                         )
-                        if new_qty > 0:
-                            await self._place_grid_order(new_side, new_price, new_qty, layer.idx, tag="gr_repl")
+                        if new_qty_base > 0:
+                            await self._place_grid_order(new_side, new_price, new_qty_base, layer.idx, tag="gr_repl")
                 else:
                     new_side = "sell" if side == "buy" else "buy"
                     avg_fill_price = db_update_payload["average_fill_price"]
@@ -626,11 +788,11 @@ class BotEngine:
                         avg_fill_price + layer.gap_abs if new_side == "sell" else avg_fill_price - layer.gap_abs
                     )
                     price_for_calc = await self._get_current_price() or new_price
-                    new_qty = self.strategy.quantize_qty(
+                    new_qty_base = self.strategy.quantize_qty(
                         (layer.size_pct * self.total_equity_twd) / price_for_calc
                     )
-                    if new_qty > 0:
-                        await self._place_grid_order(new_side, new_price, new_qty, layer.idx, tag="gr_repl")
+                    if new_qty_base > 0:
+                        await self._place_grid_order(new_side, new_price, new_qty_base, layer.idx, tag="gr_repl")
                     else:
                         log.warning(
                             "Calculated replacement qty for %s is zero, skipping.",
@@ -648,16 +810,16 @@ class BotEngine:
             
             # 2. Calculate key metrics
             total_equity = self.total_equity_twd
-            usdt_price = await self._get_current_price() or Decimal("0")
+            current_price = await self._get_current_price() or Decimal("0")
             
             msg = (
                 f"📊 **Periodic Asset Report**\n\n"
                 f"🕒 Time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC`\n"
                 f"💰 **Total Equity (TWD)**: `{total_equity:,.0f}`\n"
                 f"--------------------------------\n"
-                f"💵 USDT Balance: `{self.usdt_balance:,.2f}`\n"
-                f"💵 TWD Balance: `{self.twd_balance:,.0f}`\n"
-                f"📈 Current Price: `{usdt_price:,.2f}`\n"
+                f"💵 {self.base_unit} Balance: `{self.base_balance:,.2f}`\n"
+                f"💵 {self.quote_unit} Balance: `{self.quote_balance:,.0f}`\n"
+                f"📈 Current Price: `{current_price:,.2f}`\n"
                 f"--------------------------------\n"
                 f"⚠️ *System Operational*"
             )
@@ -669,15 +831,259 @@ class BotEngine:
             log.error("Error sending periodic report: %s", e)
 
     # ------------------------------------------------------------------ #
-    # 混合策略 / 方向性偏置 / 黑天鵝檢查
-    # （保留原始邏輯，略）
+    # 資料庫相關方法
     # ------------------------------------------------------------------ #
-    # 由於篇幅限制，這裡保留完整邏輯（已從 refactored 檔案抽取），
-    # 你的工作流已經有這一份 BotEngine，這裡的關鍵是：
-    # - 檔案位置改為 engine.bot_engine
-    # - GridStrategy 來源改為 strategy.grid_strategy.GridStrategy
+    async def _run_db_sync(self, func: Callable, *args, **kwargs) -> Any:
+        """在異步上下文中運行同步資料庫操作"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
-    # --- 資料庫相關方法 (_run_db_sync, _db_get_or_create_strategy_sync, _db_log_order, ... )
-    # 同樣保留自原始 refactored 實作，未在此重覆貼出。
+    def _db_get_or_create_strategy_sync(self, name: str, description: str, params: Dict[str, Any]) -> Optional[int]:
+        """獲取或創建策略記錄（同步方法）"""
+        try:
+            with db_session() as session:
+                strategy = session.query(DBStrategy).filter_by(name=name).first()
+                if not strategy:
+                    strategy = DBStrategy(
+                        name=name,
+                        description=description,
+                        params_json=json.dumps(params, default=str),
+                        is_active=True,
+                    )
+                    session.add(strategy)
+                    session.commit()
+                    session.refresh(strategy)
+                return strategy.id
+        except Exception as e:
+            log.error("Error getting/creating strategy: %s", e, exc_info=True)
+            return None
 
+    async def _db_log_order(self, order_data: Dict[str, Any]) -> None:
+        """記錄訂單到資料庫"""
+        try:
+            def _sync_log_order():
+                with db_session() as session:
+                    order = DBOrder(
+                        strategy_id=self.strategy_db_id,
+                        client_oid=order_data["client_oid"],
+                        exchange_order_id=order_data.get("exchange_id"),
+                        asset_pair=self.strategy.asset_pair,
+                        side=order_data["side"],
+                        order_type=order_data.get("order_type", "limit"),
+                        price=order_data["price"],
+                        quantity=order_data["qty"],
+                        status=OrderStatusEnum.OPEN,
+                        filled_quantity=order_data.get("filled_qty", Decimal("0")),
+                        layer_idx=order_data.get("layer_idx"),
+                    )
+                    session.add(order)
+                    session.commit()
 
+            await self._run_db_sync(_sync_log_order)
+        except Exception as e:
+            log.error("Error logging order to DB: %s", e, exc_info=True)
+
+    async def _db_update_order_status(self, client_oid: str, status: OrderStatusEnum) -> None:
+        """更新訂單狀態"""
+        try:
+            def _sync_update():
+                with db_session() as session:
+                    order = session.query(DBOrder).filter_by(client_oid=client_oid).first()
+                    if order:
+                        order.status = status
+                        session.commit()
+
+            await self._run_db_sync(_sync_update)
+        except Exception as e:
+            log.error("Error updating order status: %s", e, exc_info=True)
+
+    async def _db_update_order_status_dict(self, payload: Dict[str, Any]) -> None:
+        """使用字典更新訂單狀態"""
+        try:
+            def _sync_update():
+                with db_session() as session:
+                    order = session.query(DBOrder).filter_by(client_oid=payload["client_oid"]).first()
+                    if order:
+                        if "status" in payload:
+                            order.status = payload["status"]
+                        if "filled_quantity" in payload:
+                            order.filled_quantity = payload["filled_quantity"]
+                        if "average_fill_price" in payload:
+                            order.average_fill_price = payload["average_fill_price"]
+                        session.commit()
+
+            await self._run_db_sync(_sync_update)
+        except Exception as e:
+            log.error("Error updating order status (dict): %s", e, exc_info=True)
+
+    async def _db_log_daily_pnl(self, pnl_data: Dict[str, Any]) -> None:
+        """記錄每日PnL"""
+        try:
+            def _sync_log_pnl():
+                with db_session() as session:
+                    today = date.today()
+                    daily_pnl = session.query(DBDailyPNL).filter_by(
+                        trade_date=today,
+                        strategy_id=self.strategy_db_id,
+                        asset_pair=self.strategy.asset_pair,
+                    ).first()
+
+                    realized_pnl = Decimal(str(pnl_data.get("realized_pnl_twd", "0")))
+
+                    if daily_pnl:
+                        daily_pnl.realized_pnl += realized_pnl
+                        daily_pnl.net_pnl += realized_pnl
+                        daily_pnl.trades_count += 1
+                    else:
+                        daily_pnl = DBDailyPNL(
+                            trade_date=today,
+                            strategy_id=self.strategy_db_id,
+                            asset_pair=self.strategy.asset_pair,
+                            realized_pnl=realized_pnl,
+                            net_pnl=realized_pnl,
+                            pnl_currency="TWD",
+                            trades_count=1,
+                        )
+                        session.add(daily_pnl)
+                    session.commit()
+
+            await self._run_db_sync(_sync_log_pnl)
+        except Exception as e:
+            log.error("Error logging daily PnL: %s", e, exc_info=True)
+
+    async def _db_log_balance_snapshot(self) -> None:
+        """記錄餘額快照"""
+        try:
+            def _sync_log_balance():
+                with db_session() as session:
+                    now_utc = datetime.now(timezone.utc)
+                    # Base currency balance
+                    base_snapshot = DBBalanceSnapshot(
+                        snapshot_ts=now_utc,
+                        currency=self.base_coin.upper(),
+                        total_balance=self.base_balance,
+                        available_balance=self.available_base_balance,
+                    )
+                    session.add(base_snapshot)
+                    # Quote currency balance
+                    quote_snapshot = DBBalanceSnapshot(
+                        snapshot_ts=now_utc,
+                        currency=self.quote_coin.upper(),
+                        total_balance=self.quote_balance,
+                        available_balance=self.available_quote_balance,
+                    )
+                    session.add(quote_snapshot)
+                    session.commit()
+
+            await self._run_db_sync(_sync_log_balance)
+        except Exception as e:
+            log.error("Error logging balance snapshot: %s", e, exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # 其他必需方法（簡化實現）
+    # ------------------------------------------------------------------ #
+    async def _load_initial_price_history(self) -> None:
+        """載入初始價格歷史"""
+        try:
+            # 獲取最近的價格點來初始化歷史
+            current_price = await self._get_current_price()
+            if current_price:
+                timestamp_ms = int(time.time() * 1000)
+                self.strategy.price_history.append((timestamp_ms, current_price))
+                log.info("Initial price history loaded: price=%s", current_price)
+        except Exception as e:
+            log.warning("Failed to load initial price history: %s", e)
+
+    async def _handle_orphan_orders(self) -> None:
+        """處理孤兒訂單（啟動時清理）"""
+        try:
+            # 取消所有交易所上的訂單
+            await self._cancel_all_market_orders(reason="startup_cleanup")
+            log.info("Orphan orders handled.")
+        except Exception as e:
+            log.warning("Error handling orphan orders: %s", e)
+
+    async def _manage_hybrid_strategy(self) -> None:
+        """管理混合策略（趨勢跟隨）"""
+        # TODO: 實現混合策略邏輯
+        # 這需要根據策略狀態和市場條件來決定是否進入趨勢跟隨模式
+        pass
+
+    async def _manage_directional_bias(self) -> None:
+        """管理方向性偏置"""
+        # TODO: 實現方向性偏置邏輯
+        # 這需要根據EMA趨勢來調整持倉比例
+        pass
+
+    async def _check_black_swan_event(self) -> None:
+        """檢查黑天鵝事件"""
+        if not self.strategy.params.get("use_black_swan_protection", False):
+            return
+
+        try:
+            if len(self.strategy.price_history) < 2:
+                return
+
+            # 獲取最近幾分鐘的價格變動
+            check_minutes = int(self.strategy.params.get("black_swan_check_minutes", 5))
+            threshold_pct = Decimal(str(self.strategy.params.get("black_swan_threshold_pct", "0.03")))
+
+            current_price = await self._get_current_price()
+            if not current_price:
+                return
+
+            # 查找 check_minutes 前的價格
+            check_time_ms = int(time.time() * 1000) - (check_minutes * 60 * 1000)
+            past_price = None
+            for ts_ms, price in reversed(self.strategy.price_history):
+                if ts_ms <= check_time_ms:
+                    past_price = price
+                    break
+
+            if past_price and past_price > 0:
+                price_change_pct = abs((current_price - past_price) / past_price)
+                if price_change_pct >= threshold_pct:
+                    log.critical(
+                        "BLACK SWAN EVENT DETECTED! Price change: %.2f%% in %d minutes",
+                        float(price_change_pct * 100),
+                        check_minutes,
+                    )
+                    await self._cancel_all_market_orders(reason="black_swan")
+                    msg = (
+                        f"⚠️ **黑天鵝事件觸發！**\n\n"
+                        f"價格在 `{check_minutes}` 分鐘內變動了 `{price_change_pct * 100:.2f}%`。\n\n"
+                        f"所有訂單已取消，策略已暫停。請手動檢查市場狀況。"
+                    )
+                    await alerter.send_critical_alert(msg, alert_key="black_swan")
+                    self.is_halted = True
+
+        except Exception as e:
+            log.error("Error checking black swan event: %s", e, exc_info=True)
+
+    async def shutdown(self, signal_num: Optional[int] = None) -> None:
+        """關閉引擎"""
+        log.info("Shutting down BotEngine...")
+        self.is_halted = True
+
+        if self.main_loop_task:
+            self.main_loop_task.cancel()
+            try:
+                await self.main_loop_task
+            except asyncio.CancelledError:
+                pass
+
+        # 取消所有訂單
+        try:
+            await self._cancel_all_market_orders(reason="shutdown")
+        except Exception as e:
+            log.error("Error cancelling orders during shutdown: %s", e)
+
+        # 關閉 API 連接
+        try:
+            await max_api.close()
+        except Exception as e:
+            log.error("Error closing API connection: %s", e)
+
+        self.is_running = False
+        log.info("BotEngine shutdown complete.")
+        await alerter.send_system_event("🛑 交易機器人已安全關閉。")

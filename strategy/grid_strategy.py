@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Any, Deque, Tuple
 import logging
 import pandas as pd
 
-from indicators import ema, atr, adx, rsi, macd
+from core.indicators import ema, atr, adx, rsi, macd
 
 log = logging.getLogger("GridStrategy")
 getcontext().prec = 28

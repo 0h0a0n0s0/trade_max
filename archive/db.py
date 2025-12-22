@@ -23,10 +23,17 @@ log.setLevel(logging.INFO)
 
 # --- 連線設定 ---
 
-# 尋找 .env 檔案
-env_path = Path(__file__).parent / ".env"
+# 尋找 .env 檔案（從項目根目錄）
+# archive/ 目錄向上兩層到項目根目錄
+project_root = Path(__file__).parent.parent
+env_path = project_root / ".env"
 if env_path.exists():
     load_dotenv(dotenv_path=env_path)
+else:
+    # 如果根目錄沒有，也嘗試從當前目錄載入（向後兼容）
+    local_env_path = Path(__file__).parent / ".env"
+    if local_env_path.exists():
+        load_dotenv(dotenv_path=local_env_path)
 
 DB_URI = os.getenv("DB_URI")
 if not DB_URI:
