@@ -165,10 +165,10 @@ class WorkflowManager:
             
             # Threshold: -2% in 24h is significant
             if validation_roi < -0.02:
-                msg = (f"⚠️ **Daily Strategy Alert (24h)**\n\n"
-                       f"Period: `Last 24 Hours`\n"
-                       f"24h ROI: `{validation_roi:.2%}`\n"
-                       f"The strategy underperformed yesterday. Check if parameters are too aggressive.")
+                msg = (f"⚠️ **每日策略警報 (24小時)**\n\n"
+                       f"期間: `過去 24 小時`\n"
+                       f"24小時 ROI: `{validation_roi:.2%}`\n"
+                       f"策略昨日表現不佳。請檢查參數是否過於激進。")
                 await alerter.send_strategy_event(msg, alert_key='validation_alert')
             
         except Exception as e:

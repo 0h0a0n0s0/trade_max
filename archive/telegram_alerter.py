@@ -9,7 +9,7 @@ import os
 import time
 import logging
 import aiohttp
-from typing import Dict
+from typing import Dict, Optional, Callable, Awaitable
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -36,6 +36,9 @@ class TelegramAlerter:
         # 警報冷卻機制，用於避免短時間內對同一事件重複發送
         # 結構: {'alert_key': last_sent_timestamp}
         self._last_alert_time: Dict[str, float] = {}
+        
+        # 用於接收消息的 last_update_id
+        self._last_update_id: int = 0
         
         if not self.token or not self.chat_id:
             log.warning("TG_TOKEN or TG_CHAT_ID not found in .env. Telegram alerts will be simulated in logs.")
@@ -102,6 +105,91 @@ class TelegramAlerter:
             return
         text = f"🧭 **策略事件** 🧭\n\n{message}"
         await self._send_message(text)
+
+    async def send_status_update(self, message: str):
+        """發送定期狀態更新（定期報告），無冷卻時間限制"""
+        # 定期報告不需要冷卻，因為是定時發送的
+        await self._send_message(message)
+
+    async def _reply_message(self, text: str, reply_to_message_id: int):
+        """回覆特定消息"""
+        if not self.is_configured:
+            log.info(f"[TELEGRAM_SIMULATED] Reply to {reply_to_message_id}: {text}")
+            return
+
+        api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_to_message_id": reply_to_message_id,
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.post(api_url, data=payload) as response:
+                    if response.status == 200:
+                        log.debug("Telegram reply sent successfully.")
+                    else:
+                        response_text = await response.text()
+                        log.error(f"Failed to send Telegram reply: {response.status} - {response_text}")
+        except Exception as e:
+            log.error(f"Exception while sending Telegram reply: {e}", exc_info=True)
+
+    async def get_updates(self) -> list:
+        """獲取新的 Telegram 消息更新"""
+        if not self.is_configured:
+            return []
+
+        api_url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+        params = {"offset": self._last_update_id + 1, "timeout": 1}
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                async with session.get(api_url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("ok"):
+                            updates = data.get("result", [])
+                            if updates:
+                                # 更新 last_update_id
+                                self._last_update_id = max(u["update_id"] for u in updates)
+                            return updates
+                        else:
+                            log.warning(f"Telegram getUpdates failed: {data}")
+                            return []
+                    else:
+                        return []
+        except Exception as e:
+            log.debug(f"Error getting Telegram updates: {e}")
+            return []
+
+    async def process_command(
+        self, 
+        command: str, 
+        message_id: int, 
+        handler_callback: Callable[[str], Awaitable[Optional[str]]]
+    ) -> bool:
+        """處理命令並回覆
+        
+        Args:
+            command: 命令字符串（如 "/profit"）
+            message_id: 消息ID（用於回覆）
+            handler_callback: 處理命令的回調函數，應返回回覆消息
+            
+        Returns:
+            bool: 是否成功處理
+        """
+        try:
+            reply_text = await handler_callback(command)
+            if reply_text:
+                await self._reply_message(reply_text, message_id)
+                return True
+            return False
+        except Exception as e:
+            log.error(f"Error processing command {command}: {e}", exc_info=True)
+            await self._reply_message(f"❌ 處理命令時發生錯誤: {e}", message_id)
+            return False
 
 # 建立一個全局唯一的 alerter 實例，供其他檔案導入使用
 alerter = TelegramAlerter()

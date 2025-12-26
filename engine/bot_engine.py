@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Dict, Optional, Any, Callable
 import json
 
+# UTC+8 時區
+TZ_UTC8 = timezone(timedelta(hours=8))
+
 import functools
 import yaml
 from sqlalchemy import func
@@ -49,6 +52,23 @@ log = logging.getLogger("BotEngine")
 getcontext().prec = 28
 
 
+def format_time_utc8(dt: Optional[datetime] = None, format_str: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """格式化時間為 UTC+8 (台灣時間)
+    
+    Args:
+        dt: datetime 對象，如果為 None 則使用當前時間
+        format_str: 時間格式字符串
+        
+    Returns:
+        格式化後的時間字符串（UTC+8）
+    """
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    # 轉換為 UTC+8
+    dt_utc8 = dt.astimezone(TZ_UTC8)
+    return dt_utc8.strftime(format_str)
+
+
 class BotEngine:
     """
     交易機器人執行引擎
@@ -76,6 +96,7 @@ class BotEngine:
         self.is_running: bool = False
         self.is_halted: bool = False
         self.main_loop_task: Optional[asyncio.Task] = None
+        self.telegram_poll_task: Optional[asyncio.Task] = None
 
         # 貨幣符號（從配置中提取）
         self.base_coin: str = self.strategy.params.get("usdt_unit", "USDT").lower()
@@ -93,6 +114,10 @@ class BotEngine:
 
         # 訂單管理
         self.active_orders: Dict[str, Dict[str, Any]] = {}
+        
+        # 買入訂單隊列（FIFO，用於計算已實現盈虧）
+        # 格式: [{"price": Decimal, "qty": Decimal, "client_oid": str, "layer_idx": int}, ...]
+        self.buy_order_queue: list = []
 
         # 風險控制器
         self.risk_controller: Optional[RiskController] = None
@@ -104,6 +129,12 @@ class BotEngine:
         self.last_db_snapshot_ts: Optional[datetime] = None
         self.last_trade_ts: Optional[datetime] = None
         self.last_report_hour: int = -1
+
+        # 初始基準點（用於計算未實現盈虧）
+        self.initial_equity_twd: Optional[Decimal] = None
+        self.initial_price: Optional[Decimal] = None
+        self.initial_base_balance: Optional[Decimal] = None
+        self.initial_quote_balance: Optional[Decimal] = None
 
         log.info("BotEngine initialized.")
 
@@ -143,6 +174,9 @@ class BotEngine:
         # 更新餘額
         await self.update_balances()
 
+        # 記錄初始基準點（如果尚未記錄）
+        await self._record_initial_baseline()
+
         log.info("BotEngine initialization complete.")
 
     async def start(self) -> None:
@@ -161,12 +195,13 @@ class BotEngine:
 
         # 啟動主循環
         self.main_loop_task = asyncio.create_task(self._main_loop())
+        self.telegram_poll_task = asyncio.create_task(self._poll_telegram_commands())
 
         log.info("BotEngine started.")
         await alerter.send_system_event("✅ 交易機器人已成功啟動並初始化。")
 
         try:
-            await self.main_loop_task
+            await asyncio.gather(self.main_loop_task, self.telegram_poll_task)
         except asyncio.CancelledError:
             log.info("Main loop cancelled.")
         except Exception as e:  # pragma: no cover - 防禦性
@@ -175,6 +210,12 @@ class BotEngine:
                 f"❌ 主循環發生嚴重錯誤！\n\n原因: `{e}`",
                 alert_key="main_loop_error",
             )
+        finally:
+            # 取消所有任務
+            if self.main_loop_task:
+                self.main_loop_task.cancel()
+            if self.telegram_poll_task:
+                self.telegram_poll_task.cancel()
 
     async def _main_loop(self) -> None:
         """主循環"""
@@ -703,8 +744,21 @@ class BotEngine:
                     elif state in ["cancel", "failed"]:
                         self.active_orders.pop(oid, None)
                         await self._db_update_order_status(oid, OrderStatusEnum.CANCELLED)
+            except asyncio.TimeoutError:
+                log.debug("訂單 %s 狀態查詢超時，將在下次循環重試", oid)
             except Exception as e:  # pragma: no cover
-                log.warning("Error polling order %s: %s", oid, e)
+                # 暫時性網絡錯誤的友好處理
+                error_str = str(e)
+                error_type = type(e).__name__
+                
+                if "502" in error_str or "Bad Gateway" in error_str:
+                    log.debug("訂單 %s 狀態查詢失敗 (502)，服務器暫時不可用，將在下次循環重試", oid)
+                elif "DNS" in error_type or "Connector" in error_type or "nodename" in error_str:
+                    log.debug("訂單 %s 狀態查詢失敗 (DNS/網絡問題)，將在下次循環重試", oid)
+                elif "Timeout" in error_type or "timeout" in error_str.lower():
+                    log.debug("訂單 %s 狀態查詢超時，將在下次循環重試", oid)
+                else:
+                    log.warning("訂單 %s 狀態查詢錯誤: %s", oid, e)
 
             await asyncio.sleep(0.2)
 
@@ -751,20 +805,112 @@ class BotEngine:
                 client_oid,
             )
             await self.update_balances()
+            
+            # 記錄更新後的餘額和權益
+            log.info(
+                "餘額更新後：base_balance=%s, quote_balance=%s, total_equity_twd=%s",
+                self.base_balance,
+                self.quote_balance,
+                self.total_equity_twd,
+            )
 
             layer_idx, side = order.get("layer_idx"), order.get("side")
             self.active_orders.pop(client_oid, None)
 
             if layer_idx is not None:
                 layer = self.strategy.grid_layers[layer_idx]
-                if side == "sell":
-                    realized_pnl = layer.gap_abs * cummulative_qty
-                    log.info(
-                        "GRID PNL: Realized PNL of approx. %.4f TWD from trade %s",
-                        float(realized_pnl),
+                avg_fill_price = db_update_payload.get("average_fill_price", order.get("price", Decimal("0")))
+                
+                if side == "buy":
+                    # 記錄買入訂單到隊列（FIFO）
+                    self.buy_order_queue.append({
+                        "price": avg_fill_price,
+                        "qty": cummulative_qty,
+                        "client_oid": client_oid,
+                        "layer_idx": layer_idx,
+                    })
+                    log.debug(
+                        "買入訂單已記錄到隊列: price=%s, qty=%s, oid=%s",
+                        avg_fill_price,
+                        cummulative_qty,
                         client_oid,
                     )
+                elif side == "sell":
+                    # 計算已實現盈虧（使用 FIFO 配對買入訂單）
+                    realized_pnl = Decimal("0")
+                    remaining_qty = cummulative_qty
+                    
+                    # 從買入隊列中取出訂單進行配對
+                    while remaining_qty > 0 and self.buy_order_queue:
+                        buy_order = self.buy_order_queue[0]
+                        buy_price = buy_order["price"]
+                        buy_qty = buy_order["qty"]
+                        
+                        # 計算配對的數量
+                        matched_qty = min(remaining_qty, buy_qty)
+                        
+                        # 計算這部分的盈虧（扣除手續費）
+                        # 手續費率從配置中讀取
+                        fee_rate = Decimal(str(self.strategy.params.get("taker_fee", "0.0002")))
+                        
+                        # 買入成本 = 買入價 × 數量 + 買入手續費
+                        buy_cost = buy_price * matched_qty * (Decimal("1") + fee_rate)
+                        # 賣出收入 = 賣出價 × 數量 - 賣出手續費
+                        sell_revenue = avg_fill_price * matched_qty * (Decimal("1") - fee_rate)
+                        
+                        # 盈虧 = 賣出收入 - 買入成本
+                        trade_pnl = sell_revenue - buy_cost
+                        realized_pnl += trade_pnl
+                        
+                        log.debug(
+                            "配對訂單: 買入價=%s, 賣出價=%s, 數量=%s, PnL=%s",
+                            buy_price,
+                            avg_fill_price,
+                            matched_qty,
+                            trade_pnl,
+                        )
+                        
+                        remaining_qty -= matched_qty
+                        buy_order["qty"] -= matched_qty
+                        
+                        # 如果買入訂單的數量已用完，從隊列中移除
+                        if buy_order["qty"] <= 0:
+                            self.buy_order_queue.pop(0)
+                    
+                    # 如果還有未配對的賣出數量，使用理論值計算（fallback）
+                    if remaining_qty > 0:
+                        log.warning(
+                            "賣出訂單 %s 部分未配對到買入訂單 (剩餘數量: %s)，使用理論值計算",
+                            client_oid,
+                            remaining_qty,
+                        )
+                        # 使用理論盈虧（gap × qty）作為 fallback
+                        fallback_pnl = layer.gap_abs * remaining_qty
+                        realized_pnl += fallback_pnl
+                    
+                    log.info(
+                        "GRID PNL: Realized PNL of %.4f TWD from trade %s (賣出價=%s, 數量=%s)",
+                        float(realized_pnl),
+                        client_oid,
+                        avg_fill_price,
+                        cummulative_qty,
+                    )
                     await self._db_log_daily_pnl({"realized_pnl_twd": realized_pnl})
+                    
+                    # 發送交易通知到 Telegram
+                    avg_fill_price = db_update_payload.get("average_fill_price", order.get("price", Decimal("0")))
+                    pnl_msg = (
+                        f"💰 **交易通知**\n\n"
+                        f"✅ 訂單已成交\n"
+                        f"📊 訂單ID: `{client_oid}`\n"
+                        f"🔄 方向: 賣出\n"
+                        f"📈 價格: `{avg_fill_price:,.2f} {self.quote_unit}`\n"
+                        f"📦 數量: `{cummulative_qty} {self.base_unit}`\n"
+                        f"💵 **已實現收益 (PnL)**: `{realized_pnl:,.2f} {self.quote_unit}`\n"
+                        f"🏷️ 層級: {layer_idx}\n"
+                        f"🕒 時間: `{format_time_utc8(format_str='%Y-%m-%d %H:%M:%S')}` (UTC+8)"
+                    )
+                    await alerter.send_strategy_event(pnl_msg, alert_key=f"trade_{client_oid}")
 
                 # 掛反向單
                 if self.strategy.strategy_state == "TREND_FOLLOWING" and self.strategy.trend_position:
@@ -776,11 +922,43 @@ class BotEngine:
                             avg_fill_price + layer.gap_abs if new_side == "sell" else avg_fill_price - layer.gap_abs
                         )
                         price_for_calc = await self._get_current_price() or new_price
-                        new_qty_base = self.strategy.quantize_qty(
-                            (layer.size_pct * self.total_equity_twd) / price_for_calc
-                        )
+                        
+                        # 計算原始數量
+                        raw_qty = (layer.size_pct * self.total_equity_twd) / price_for_calc
+                        # 使用與網格重建相同的量化邏輯（支持更精細精度）
+                        new_qty_base = self.strategy.quantize_qty(raw_qty)
+                        if new_qty_base <= 0 and raw_qty > 0:
+                            from decimal import ROUND_UP
+                            finer_precision = Decimal("0.00001")  # 0.00001 BTC
+                            new_qty_base = raw_qty.quantize(finer_precision, rounding=ROUND_UP)
+                            log.debug(
+                                "替換訂單數量量化為 0，使用更精細精度：原始=%s, 量化後=%s",
+                                raw_qty,
+                                new_qty_base,
+                            )
+                        
                         if new_qty_base > 0:
+                            log.info(
+                                "準備補單：方向=%s, 價格=%s, 數量=%s, 層級=%d",
+                                new_side,
+                                new_price,
+                                new_qty_base,
+                                layer_idx,
+                            )
                             await self._place_grid_order(new_side, new_price, new_qty_base, layer.idx, tag="gr_repl")
+                        else:
+                            log.warning(
+                                "訂單 %s 成交後，計算替換訂單數量為 0，跳過補單。"
+                                "原始數量: %s, 量化後: 0, 層級: %d, 方向: %s, "
+                                "total_equity_twd: %s, price_for_calc: %s, size_pct: %s",
+                                client_oid,
+                                float(raw_qty),
+                                layer_idx,
+                                new_side,
+                                float(self.total_equity_twd),
+                                float(price_for_calc),
+                                float(layer.size_pct),
+                            )
                 else:
                     new_side = "sell" if side == "buy" else "buy"
                     avg_fill_price = db_update_payload["average_fill_price"]
@@ -788,20 +966,72 @@ class BotEngine:
                         avg_fill_price + layer.gap_abs if new_side == "sell" else avg_fill_price - layer.gap_abs
                     )
                     price_for_calc = await self._get_current_price() or new_price
-                    new_qty_base = self.strategy.quantize_qty(
-                        (layer.size_pct * self.total_equity_twd) / price_for_calc
-                    )
+                    
+                    # 計算原始數量
+                    raw_qty = (layer.size_pct * self.total_equity_twd) / price_for_calc
+                    # 使用與網格重建相同的量化邏輯（支持更精細精度）
+                    new_qty_base = self.strategy.quantize_qty(raw_qty)
+                    if new_qty_base <= 0 and raw_qty > 0:
+                        from decimal import ROUND_UP
+                        finer_precision = Decimal("0.00001")  # 0.00001 BTC
+                        new_qty_base = raw_qty.quantize(finer_precision, rounding=ROUND_UP)
+                        log.debug(
+                            "替換訂單數量量化為 0，使用更精細精度：原始=%s, 量化後=%s",
+                            raw_qty,
+                            new_qty_base,
+                        )
+                    
                     if new_qty_base > 0:
+                        log.info(
+                            "準備補單：方向=%s, 價格=%s, 數量=%s, 層級=%d",
+                            new_side,
+                            new_price,
+                            new_qty_base,
+                            layer_idx,
+                        )
                         await self._place_grid_order(new_side, new_price, new_qty_base, layer.idx, tag="gr_repl")
                     else:
                         log.warning(
-                            "Calculated replacement qty for %s is zero, skipping.",
+                            "訂單 %s 成交後，計算替換訂單數量為 0，跳過補單。"
+                            "原始數量: %s, 量化後: 0, 層級: %d, 方向: %s, "
+                            "total_equity_twd: %s, price_for_calc: %s, size_pct: %s",
                             client_oid,
+                            float(raw_qty),
+                            layer_idx,
+                            new_side,
+                            float(self.total_equity_twd),
+                            float(price_for_calc),
+                            float(layer.size_pct),
                         )
 
     # ------------------------------------------------------------------ #
     # [Added] Periodic Reporting
     # ------------------------------------------------------------------ #
+    async def _get_pnl_summary(self, days: int) -> Decimal:
+        """查詢指定天數的真實收益統計（days=1 表示只查詢今天）"""
+        try:
+            def _sync_get_pnl():
+                with db_session() as session:
+                    end_date = date.today()
+                    if days == 1:
+                        # 只查詢今天
+                        start_date = end_date
+                    else:
+                        # 查詢過去 N 天（包含今天）
+                        start_date = end_date - timedelta(days=days - 1)
+                    result = session.query(func.sum(DBDailyPNL.realized_pnl)).filter(
+                        DBDailyPNL.strategy_id == self.strategy_db_id,
+                        DBDailyPNL.asset_pair == self.strategy.asset_pair,
+                        DBDailyPNL.trade_date >= start_date,
+                        DBDailyPNL.trade_date <= end_date,
+                    ).scalar()
+                    return Decimal(str(result)) if result else Decimal("0")
+            
+            return await self._run_db_sync(_sync_get_pnl)
+        except Exception as e:
+            log.error("Error getting PnL summary for %d days: %s", days, e, exc_info=True)
+            return Decimal("0")
+
     async def _send_periodic_report(self) -> None:
         """Send periodic performance report (Scheduled at 0, 8, 18 hours)."""
         try:
@@ -812,23 +1042,142 @@ class BotEngine:
             total_equity = self.total_equity_twd
             current_price = await self._get_current_price() or Decimal("0")
             
+            # 3. 查詢各時間段的真實收益
+            pnl_today = await self._get_pnl_summary(1)
+            pnl_7d = await self._get_pnl_summary(7)
+            pnl_30d = await self._get_pnl_summary(30)
+            pnl_180d = await self._get_pnl_summary(180)
+            pnl_365d = await self._get_pnl_summary(365)
+            
+            # 計算未實現盈虧
+            unrealized_pnl = Decimal("0")
+            if self.initial_equity_twd and self.initial_equity_twd > 0:
+                total_realized_pnl = await self._get_pnl_summary(365)  # 累積所有已實現盈虧
+                unrealized_pnl = total_equity - self.initial_equity_twd - total_realized_pnl
+            
             msg = (
-                f"📊 **Periodic Asset Report**\n\n"
-                f"🕒 Time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC`\n"
-                f"💰 **Total Equity (TWD)**: `{total_equity:,.0f}`\n"
+                f"📊 **定期資產報告**\n\n"
+                f"🕒 時間: `{format_time_utc8(format_str='%Y-%m-%d %H:%M')}` (UTC+8)\n"
+                f"💰 **總權益 (TWD)**: `{total_equity:,.0f}`\n"
                 f"--------------------------------\n"
-                f"💵 {self.base_unit} Balance: `{self.base_balance:,.2f}`\n"
-                f"💵 {self.quote_unit} Balance: `{self.quote_balance:,.0f}`\n"
-                f"📈 Current Price: `{current_price:,.2f}`\n"
+                f"💵 {self.base_unit} 餘額: `{self.base_balance:,.2f}`\n"
+                f"💵 {self.quote_unit} 餘額: `{self.quote_balance:,.0f}`\n"
+                f"📈 當前價格: `{current_price:,.2f}`\n"
                 f"--------------------------------\n"
-                f"⚠️ *System Operational*"
+                f"💎 **已實現收益 (PnL)**\n"
+                f"📅 當日: `{pnl_today:,.2f} TWD`\n"
+                f"📅 近7日: `{pnl_7d:,.2f} TWD`\n"
+                f"📅 近30日: `{pnl_30d:,.2f} TWD`\n"
+                f"📅 近180日: `{pnl_180d:,.2f} TWD`\n"
+                f"📅 近365日: `{pnl_365d:,.2f} TWD`\n"
+                f"--------------------------------\n"
+                f"📊 **未實現收益**\n"
+                f"📈 持幣價差: `{unrealized_pnl:,.2f} TWD`\n"
+                f"--------------------------------\n"
+                f"⚠️ *系統運作中*"
             )
             
             # Send via alerter
             await alerter.send_status_update(msg)
             
         except Exception as e:
-            log.error("Error sending periodic report: %s", e)
+            log.error("Error sending periodic report: %s", e, exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # Telegram 命令處理
+    # ------------------------------------------------------------------ #
+    async def _poll_telegram_commands(self) -> None:
+        """輪詢 Telegram 消息並處理命令"""
+        log.info("Telegram command polling started.")
+        while self.is_running and not self.is_halted:
+            try:
+                updates = await alerter.get_updates()
+                for update in updates:
+                    message = update.get("message")
+                    if not message:
+                        continue
+                    
+                    # 只處理來自授權 chat_id 的消息
+                    chat_id = str(message.get("chat", {}).get("id"))
+                    if chat_id != str(alerter.chat_id):
+                        log.debug(f"Ignoring message from unauthorized chat_id: {chat_id}")
+                        continue
+                    
+                    text = message.get("text", "").strip()
+                    message_id = message.get("message_id")
+                    
+                    if text.startswith("/"):
+                        # 這是一個命令
+                        command = text.split()[0].lower()  # 獲取命令部分（例如 "/profit"）
+                        await alerter.process_command(command, message_id, self._handle_telegram_command)
+                
+                await asyncio.sleep(2)  # 每2秒檢查一次
+            except asyncio.CancelledError:
+                log.info("Telegram polling cancelled.")
+                break
+            except Exception as e:
+                log.error(f"Error in Telegram polling: {e}", exc_info=True)
+                await asyncio.sleep(5)  # 錯誤時等待更長時間
+
+    async def _handle_telegram_command(self, command: str) -> Optional[str]:
+        """處理 Telegram 命令
+        
+        Args:
+            command: 命令字符串（如 "/profit"）
+            
+        Returns:
+            回覆消息文本，如果命令未識別則返回 None
+        """
+        if command == "/profit":
+            try:
+                # 查詢各時間段的真實收益
+                pnl_today = await self._get_pnl_summary(1)
+                pnl_7d = await self._get_pnl_summary(7)
+                pnl_30d = await self._get_pnl_summary(30)
+                pnl_180d = await self._get_pnl_summary(180)
+                pnl_365d = await self._get_pnl_summary(365)
+                
+                # 更新餘額以獲取當前總權益
+                await self.update_balances()
+                total_equity = self.total_equity_twd
+                current_price = await self._get_current_price() or Decimal("0")
+                
+                # 計算未實現盈虧
+                unrealized_pnl = Decimal("0")
+                if self.initial_equity_twd and self.initial_equity_twd > 0:
+                    total_realized_pnl = await self._get_pnl_summary(365)  # 累積所有已實現盈虧
+                    unrealized_pnl = total_equity - self.initial_equity_twd - total_realized_pnl
+                
+                reply = (
+                    f"💎 **當前收益查詢**\n\n"
+                    f"📊 **已實現收益 (PnL)**\n"
+                    f"📅 當日: `{pnl_today:,.2f} TWD`\n"
+                    f"📅 近7日: `{pnl_7d:,.2f} TWD`\n"
+                    f"📅 近30日: `{pnl_30d:,.2f} TWD`\n"
+                    f"📅 近180日: `{pnl_180d:,.2f} TWD`\n"
+                    f"📅 近365日: `{pnl_365d:,.2f} TWD`\n"
+                    f"--------------------------------\n"
+                    f"📈 **未實現收益**\n"
+                    f"💎 持幣價差: `{unrealized_pnl:,.2f} TWD`\n"
+                    f"--------------------------------\n"
+                    f"💰 總權益: `{total_equity:,.2f} TWD`\n"
+                    f"📈 當前價格: `{current_price:,.2f}`\n"
+                    f"🕒 查詢時間: `{format_time_utc8(format_str='%Y-%m-%d %H:%M:%S')}` (UTC+8)"
+                )
+                return reply
+            except Exception as e:
+                log.error(f"Error handling /profit command: {e}", exc_info=True)
+                return f"❌ 查詢收益時發生錯誤: {e}"
+        elif command == "/help":
+            reply = (
+                f"📖 **可用命令**\n\n"
+                f"`/profit` - 查詢當前真實收益 (PnL)\n"
+                f"`/help` - 顯示此幫助訊息"
+            )
+            return reply
+        else:
+            # 未知命令
+            return None
 
     # ------------------------------------------------------------------ #
     # 資料庫相關方法
@@ -979,6 +1328,84 @@ class BotEngine:
         except Exception as e:
             log.error("Error logging balance snapshot: %s", e, exc_info=True)
 
+    async def _record_initial_baseline(self) -> None:
+        """記錄初始基準點（用於計算未實現盈虧）
+        
+        策略：
+        1. 檢查配置文件中是否有 initial_equity_twd 設置
+        2. 如果沒有，檢查資料庫中是否已有初始權益記錄（從 Strategy 表）
+        3. 如果都沒有，使用當前總權益作為初始權益（第一次啟動）
+        """
+        try:
+            # 1. 優先從配置文件讀取初始權益
+            initial_equity_from_config = self.strategy.params.get("initial_equity_twd")
+            if initial_equity_from_config:
+                self.initial_equity_twd = Decimal(str(initial_equity_from_config))
+                current_price = await self._get_current_price()
+                if current_price:
+                    self.initial_price = current_price
+                log.info(
+                    "從配置文件讀取初始權益: %s TWD",
+                    self.initial_equity_twd,
+                )
+                return
+            
+            # 2. 從資料庫查詢是否已有初始權益記錄
+            def _sync_get_initial_equity():
+                with db_session() as session:
+                    strategy = session.query(DBStrategy).filter_by(id=self.strategy_db_id).first()
+                    if strategy and strategy.params_json:
+                        import json
+                        params = json.loads(strategy.params_json)
+                        if "initial_equity_twd" in params:
+                            return Decimal(str(params["initial_equity_twd"]))
+                    return None
+            
+            stored_initial_equity = await self._run_db_sync(_sync_get_initial_equity)
+            if stored_initial_equity and stored_initial_equity > 0:
+                self.initial_equity_twd = stored_initial_equity
+                current_price = await self._get_current_price()
+                if current_price:
+                    self.initial_price = current_price
+                log.info(
+                    "從資料庫讀取初始權益: %s TWD",
+                    self.initial_equity_twd,
+                )
+                return
+            
+            # 3. 如果都沒有，使用當前總權益作為初始權益（第一次啟動）
+            current_price = await self._get_current_price()
+            if current_price:
+                self.initial_price = current_price
+                self.initial_equity_twd = self.total_equity_twd
+                self.initial_base_balance = self.base_balance
+                self.initial_quote_balance = self.quote_balance
+                
+                # 保存到資料庫的 Strategy 記錄中
+                def _sync_save_initial_equity():
+                    with db_session() as session:
+                        strategy = session.query(DBStrategy).filter_by(id=self.strategy_db_id).first()
+                        if strategy:
+                            import json
+                            params = json.loads(strategy.params_json) if strategy.params_json else {}
+                            params["initial_equity_twd"] = str(self.initial_equity_twd)
+                            strategy.params_json = json.dumps(params)
+                            session.commit()
+                
+                await self._run_db_sync(_sync_save_initial_equity)
+                
+                log.info(
+                    "首次啟動，記錄初始權益: base=%s, quote=%s, price=%s, equity=%s TWD",
+                    self.initial_base_balance,
+                    self.initial_quote_balance,
+                    self.initial_price,
+                    self.initial_equity_twd,
+                )
+            else:
+                log.warning("無法獲取當前價格，無法計算初始權益")
+        except Exception as e:
+            log.error("Error recording initial baseline: %s", e, exc_info=True)
+
     # ------------------------------------------------------------------ #
     # 其他必需方法（簡化實現）
     # ------------------------------------------------------------------ #
@@ -1065,10 +1492,19 @@ class BotEngine:
         log.info("Shutting down BotEngine...")
         self.is_halted = True
 
+        # 取消主循環任務
         if self.main_loop_task:
             self.main_loop_task.cancel()
             try:
                 await self.main_loop_task
+            except asyncio.CancelledError:
+                pass
+        
+        # 取消 Telegram 輪詢任務
+        if self.telegram_poll_task:
+            self.telegram_poll_task.cancel()
+            try:
+                await self.telegram_poll_task
             except asyncio.CancelledError:
                 pass
 

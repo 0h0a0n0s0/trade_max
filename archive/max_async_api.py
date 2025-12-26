@@ -166,20 +166,82 @@ class MaxAPI:
             async with self._session.request(method.upper(), url, params=query_params, json=None, headers=headers) as r:
                 text_response = await r.text()
                 if not r.ok:
-                    logger.error(f"API request failed: {r.status} {r.reason} for {method} {url} with params {query_params} - Response: {text_response[:300]}")
+                    # 502 Bad Gateway 的友好訊息
+                    if r.status == 502:
+                        logger.warning(
+                            f"API 服務器暫時不可用 (502 Bad Gateway)。"
+                            f"請求: {method} {api_path} | 這通常是暫時性問題，系統會自動重試。"
+                        )
+                    else:
+                        logger.error(
+                            f"API 請求失敗: HTTP {r.status} {r.reason} | "
+                            f"請求: {method} {api_path} | "
+                            f"響應: {text_response[:200]}"
+                        )
                 r.raise_for_status()
                 return json.loads(text_response) if text_response else None
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"API 請求超時 | 請求: {method} {api_path} | "
+                f"這可能是網絡延遲或服務器響應慢，系統會自動重試。"
+            )
+            raise
+        except aiohttp.ClientResponseError as e:
+            # 502 錯誤的友好處理
+            if e.status == 502:
+                logger.warning(
+                    f"API 服務器暫時不可用 (502 Bad Gateway) | "
+                    f"請求: {method} {api_path} | "
+                    f"這通常是暫時性問題，系統會自動重試。"
+                )
+            else:
+                logger.error(
+                    f"API 請求失敗: HTTP {e.status} {e.message} | "
+                    f"請求: {method} {api_path}"
+                )
+            raise
+        except (aiohttp.ClientConnectorDNSError, aiohttp.ClientConnectorError) as e:
+            # DNS 解析錯誤或連接錯誤的友好處理
+            logger.warning(
+                f"API 連接失敗 (DNS/網絡問題) | "
+                f"請求: {method} {api_path} | "
+                f"這通常是網絡暫時不穩定或 DNS 解析問題，系統會自動重試。"
+            )
+            raise
         except Exception as e:
-            logger.error(f"Generic error on API request for {method} {url}: {e}", exc_info=True)
+            logger.error(
+                f"API 請求發生未知錯誤: {type(e).__name__} | "
+                f"請求: {method} {api_path} | "
+                f"錯誤: {str(e) or '無詳細訊息'}",
+                exc_info=True
+            )
             raise
 
     async def get_v2_ticker(self, market: str) -> Optional[Dict]:
         if not self._is_initialized or not self._session: raise RuntimeError("API client not initialized.")
+        url = f"{self._base_url_v2}/api/v2/tickers/{market.lower()}"
         try:
-            async with self._session.get(f"{self._base_url_v2}/api/v2/tickers/{market.lower()}") as r:
-                r.raise_for_status(); return await r.json()
+            async with self._session.get(url) as r:
+                if not r.ok:
+                    error_text = await r.text()
+                    logger.error(
+                        f"Failed to get ticker for {market}: HTTP {r.status} {r.reason}. "
+                        f"URL: {url}. Response: {error_text[:200]}"
+                    )
+                    return None
+                return await r.json()
+        except asyncio.TimeoutError:
+            logger.error(f"Failed to get ticker for {market}: Request timeout. URL: {url}")
+            return None
+        except aiohttp.ClientError as e:
+            logger.error(f"Failed to get ticker for {market}: Client error - {type(e).__name__}: {e}. URL: {url}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to get ticker for {market}: {e}"); return None
+            logger.error(
+                f"Failed to get ticker for {market}: {type(e).__name__}: {str(e) or 'No error message'}. URL: {url}",
+                exc_info=True
+            )
+            return None
    
     async def get_v2_k_data(self, market: str, limit: int, period: int) -> Optional[List]:
         if not self._is_initialized or not self._session: raise RuntimeError("API client not initialized.")
